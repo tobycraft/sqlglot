@@ -60,6 +60,12 @@ def execute(
             table = nested_get(tables_.mapping, *zip(keys, keys))
             assert table is not None
 
+            if not table.columns:
+                # A schema mapping can't record a table with zero columns, so give it a
+                # placeholder that isn't a real column on the underlying table.
+                nested_set(schema, [*keys, ""], exp.DataType.Type.UNKNOWN)
+                continue
+
             for column in table.columns:
                 value = table[0][column]
                 column_type = (

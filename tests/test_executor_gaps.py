@@ -198,14 +198,14 @@ def test_missing_function(expr, row, expected):
     assert list(res.rows) == [(expected,)]
 
 
-# --- Missing array functions: still blocked, but no longer by ENV ----------
+# --- Missing array functions: no longer blocked by the empty table schema --
 # ENV now has ARRAYSORT, ARRAYDISTINCT, ARRAYS_OVERLAP, ARRAYMIN, ARRAYSIZE
 # and FLATTEN, but these cases take no columns from `t`, so the row is `{}`.
-# `execute()` infers an empty schema for a zero-column table, whose
-# `supported_table_args` (`()`) then mismatches the literal table's
-# (`("this",)`), and `execute()` raises before the plan ever runs. That is a
-# planner/schema gap, not a missing-function one - distinct root cause, so
-# still xfails.
+# Fixed: execute() now registers a zero-column table in the inferred schema
+# with a placeholder column (rather than omitting the table entirely), so the
+# schema's `supported_table_args` lines up with the literal table's instead of
+# collapsing to `()` and tripping the "Tables must support the same table args
+# as schema" check before the plan ever runs.
 
 _MISSING_FUNCTION_CASES = [
     pytest.param("ARRAY_SORT(ARRAY[3, 1, 2])", {}, [1, 2, 3], id="array_sort"),
@@ -218,11 +218,6 @@ _MISSING_FUNCTION_CASES = [
 
 
 @pytest.mark.parametrize("expr, row, expected", _MISSING_FUNCTION_CASES)
-@pytest.mark.xfail(
-    strict=True,
-    reason="zero-column literal table's supported_table_args mismatches the inferred "
-    "empty schema's: ExecuteError before the function is ever called",
-)
 def test_missing_function_blocked_by_empty_table_schema(expr, row, expected):
     res = execute(f"SELECT {expr} AS x FROM t", tables={"t": [row]}, dialect="presto")
     assert list(res.rows) == [(expected,)]
