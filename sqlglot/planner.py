@@ -129,7 +129,18 @@ class Step:
             ctes = ctes.copy()
             for cte in with_.expressions:
                 step = Step.from_expression(cte.this, ctes)
+                old_name = step.name
                 step.name = cte.alias
+
+                if old_name and old_name != step.name:
+                    # same stale-qualifier hazard as the pass-through-derived-table
+                    # rename in Scan.from_expression below, but here for a CTE whose
+                    # body's outermost step was itself already renamed (e.g. a
+                    # pass-through derived table nested directly under the CTE)
+                    _rename_table_qualifier(step.projections, old_name, step.name)
+                    if step.condition:
+                        _rename_table_qualifier([step.condition], old_name, step.name)
+
                 ctes[step.name] = step  # type: ignore
 
         from_ = expression.args.get("from_")

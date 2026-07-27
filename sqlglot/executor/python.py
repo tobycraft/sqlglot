@@ -97,6 +97,12 @@ class PythonExecutor:
         elif source in context:
             if not step.projections and not step.condition:
                 return self.context({step.name: context.tables[source]})
+            if step.name and step.name != source and step.name not in context.tables:
+                # a CTE-level rename (e.g. a CTE that just re-selects from another
+                # CTE by name) can leave step.name out of sync with the dependency
+                # name (source); alias it onto the same table so projections/
+                # condition qualified with the new name still resolve
+                context = self.context({step.name: context.tables[source], **context.tables})
             table_iter = context.table_iter(source)
         else:
             context, table_iter = self.scan_table(step)
@@ -183,6 +189,15 @@ class PythonExecutor:
             condition = self.generate(join["condition"])
             if condition:
                 source_context.filter(condition)
+
+        if step.name and step.name != source and step.name not in source_context.tables:
+            # a CTE-level rename (a pass-through CTE body whose outermost step is
+            # itself a Join, e.g. one with no real joins) can leave step.name out of
+            # sync with source_name; alias it onto the same range so projections/
+            # condition qualified with the new name still resolve
+            source_context = self.context(
+                {step.name: source_context.tables[source], **source_context.tables}
+            )
 
         if not step.condition and not step.projections:
             return source_context
