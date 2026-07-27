@@ -58,6 +58,12 @@ def _lambda_sql(self, e: exp.Lambda) -> str:
     return f"lambda {self.expressions(e, flat=True)}: {self.sql(e, 'this')}"
 
 
+def _cast_sql(self, e: exp.Cast) -> str:
+    to = e.args["to"]
+    params = "".join(f", {self.sql(p)}" for p in to.expressions)
+    return f"CAST({self.sql(e.this)}, exp.DType.{to.this.value}{params})"
+
+
 def _div_sql(self: generator.Generator, e: exp.Div) -> str:
     denominator = self.sql(e, "expression")
 
@@ -82,7 +88,7 @@ class PythonGenerator(generator.Generator):
         exp.And: lambda self, e: self.binary(e, "and"),
         exp.Between: _rename,
         exp.Boolean: lambda self, e: "True" if e.this else "False",
-        exp.Cast: lambda self, e: f"CAST({self.sql(e.this)}, exp.DType.{e.args['to']})",
+        exp.Cast: _cast_sql,
         exp.Column: lambda self, e: f"scope[{self.sql(e, 'table') or None}][{self.sql(e.this)}]",
         exp.Concat: lambda self, e: self.func(
             "SAFECONCAT" if e.args.get("safe") else "CONCAT", *e.expressions

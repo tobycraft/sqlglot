@@ -81,11 +81,10 @@ def test_aggregate_filter_clause():
 
 
 # --- Parameterized CAST types ------------------------------------------------
-# PythonGenerator.TRANSFORMS[exp.Cast] stringifies the target type directly
-# into `exp.DType.<TYPE>`. That works for a bare type (DECIMAL, VARCHAR) but a
-# parameterized one like DECIMAL(18, 2) renders its precision/scale as if they
-# were call arguments - `exp.DType.DECIMAL(18, 2)` - and DType members aren't
-# callable.
+# Fixed: PythonGenerator.TRANSFORMS[exp.Cast] now emits the type's
+# precision/scale or length as extra positional args to `CAST(...)` instead of
+# stringifying them into the type name, and env.py's `cast()` uses them to
+# round DECIMAL-family values and truncate TEXT-family values.
 
 _PARAMETERIZED_CAST_CASES = [
     pytest.param("CAST(a AS DECIMAL(18, 2))", {"a": 1.256}, 1.26, id="decimal_with_precision"),
@@ -94,25 +93,17 @@ _PARAMETERIZED_CAST_CASES = [
 
 
 @pytest.mark.parametrize("expr, row, expected", _PARAMETERIZED_CAST_CASES)
-@pytest.mark.xfail(
-    strict=True,
-    reason="CAST to a parameterized type raises TypeError: 'DType' object is not callable",
-)
 def test_cast_to_parameterized_type(expr, row, expected):
     res = execute(f"SELECT {expr} AS x FROM t", tables={"t": [row]}, dialect="presto")
     assert list(res.rows) == [(expected,)]
 
 
-# --- Bare (unparameterized) DECIMAL cast: no error, but silently wrong ------
-# `to in exp.DataType.NUMERIC_TYPES` matches DECIMAL and returns `int(this)`,
-# so CAST(... AS DECIMAL) truncates to an integer instead of preserving
-# fractional precision. No exception is raised - this is a silent correctness
-# gap, not a crash.
+# --- Bare (unparameterized) DECIMAL cast ------------------------------------
+# Fixed: env.py's `cast()` now treats the whole DECIMAL family as a float type
+# (like FLOAT/DOUBLE) instead of falling into the NUMERIC_TYPES branch that
+# truncates via `int(this)`.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="CAST(... AS DECIMAL) truncates to int instead of preserving precision"
-)
 def test_cast_to_bare_decimal_preserves_fraction():
     res = execute(
         "SELECT CAST(a AS DECIMAL) AS x FROM t", tables={"t": [{"a": 1.5}]}, dialect="presto"
