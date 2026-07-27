@@ -685,24 +685,25 @@ def test_simple_case_with_subject():
     ]
 
 
-# --- Open: CROSS JOIN UNNEST of a column reference (not a literal array) ----
+# --- Fixed: CROSS JOIN UNNEST of a column reference (not a literal array) ---
 # The already-fixed test_unnest_in_from_clause above covers `UNNEST(ARRAY[1,
 # 2, 3])` - a literal array needing no row context to evaluate.
-# `PythonExecutor.scan_unnest` evaluates the UNNEST expression against a
-# brand-new, completely empty static context - fine for a literal, but a
-# real column reference like `UNNEST(t.arr)` needs the *joined* row's own
-# context to resolve `t`, which is never wired in: a bare `KeyError` naming
-# the outer table, not a wrong answer.
+# `PythonExecutor.scan_unnest` evaluated the UNNEST expression against a
+# brand-new, completely empty static context - fine for a literal, but a real
+# column reference like `UNNEST(t.arr)` needs the *joined* row's own context
+# to resolve `t`, which was never wired in: a bare `KeyError` naming the outer
+# table, not a wrong answer. The array to explode differs per outer row, so
+# it can't be scanned as an independent Step the way a real table can -
+# planner.Join.from_joins now stashes the raw Unnest node on the join info
+# instead of adding a Scan dependency for it, and PythonExecutor.join
+# evaluates it directly against each row of the join accumulated so far
+# (`lateral_unnest_join`), the way a LATERAL join would.
 #
 # Found stress-testing sqlcov against a real Athena CTAS: `FROM _opened_loans
 # CROSS JOIN UNNEST(_opened_loans.customer_set_latest) AS u(cust_id)` -
 # exploding an array-typed column from the joined CTE itself, not a literal.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="PythonExecutor: CROSS JOIN UNNEST(<column reference>) can't resolve the outer row",
-)
 def test_unnest_of_column_reference():
     res = execute(
         "SELECT t.id, u.x FROM t CROSS JOIN UNNEST(t.arr) AS u(x)",

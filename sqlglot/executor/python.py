@@ -170,15 +170,21 @@ class PythonExecutor:
         column_ranges = {source: range(0, len(source_table.columns))}
 
         for name, join in step.joins.items():
-            table = context.tables[name]
             start = max(r.stop for r in column_ranges.values())
-            column_ranges[name] = range(start, len(table.columns) + start)
-            join_context = self.context({name: table})
 
-            if join.get("source_key"):
-                table = self.hash_join(join, source_context, join_context)
+            unnest = join.get("unnest")
+            if unnest is not None:
+                table = self.lateral_unnest_join(unnest, source_context)
+                column_ranges[name] = range(start, len(table.columns))
             else:
-                table = self.nested_loop_join(join, source_context, join_context)
+                table = context.tables[name]
+                column_ranges[name] = range(start, len(table.columns) + start)
+                join_context = self.context({name: table})
+
+                if join.get("source_key"):
+                    table = self.hash_join(join, source_context, join_context)
+                else:
+                    table = self.nested_loop_join(join, source_context, join_context)
 
             source_context = self.context(
                 {
@@ -217,6 +223,27 @@ class PythonExecutor:
                     for name, table in source_context.tables.items()
                 }
             )
+
+    def lateral_unnest_join(self, unnest, source_context):
+        """Explode an UNNEST(...) that may reference a column of an already-joined
+        source (e.g. `CROSS JOIN UNNEST(t.arr)`) against each row of that source,
+        the way a LATERAL join would - a plain nested-loop/hash join can't work here
+        since the array to explode differs per outer row rather than being a single,
+        independently-scannable table.
+        """
+        offset = unnest.args.get("offset")
+        columns = [column.name for column in unnest.selects] or [
+            f"_col_{i}" for i in range(len(unnest.expressions) + bool(offset))
+        ]
+        exprs = self.generate_tuple(unnest.expressions)
+
+        table = Table(source_context.columns + tuple(columns))
+        for reader, ctx in source_context:
+            arrays = [ctx.eval(expr) for expr in exprs]
+            for i, values in enumerate(itertools.zip_longest(*arrays)):
+                table.append(reader.row + (values + (i + 1,) if offset else values))
+
+        return table
 
     def nested_loop_join(self, _join, source_context, join_context):
         table = Table(source_context.columns + join_context.columns)

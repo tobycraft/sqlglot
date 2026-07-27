@@ -436,14 +436,26 @@ class Join(Step):
 
         for join in joins:
             source_key, join_key, condition = join_condition(join)
-            step.joins[join.alias_or_name] = {
+            alias_ = join.alias_or_name
+            step.joins[alias_] = {
                 "side": join.side,  # type: ignore
                 "join_key": join_key,
                 "source_key": source_key,
                 "condition": condition,
             }
 
-            step.add_dependency(Scan.from_expression(join.this, ctes))
+            if isinstance(join.this, exp.Unnest):
+                # An UNNEST may reference a column from an earlier FROM/JOIN source
+                # (e.g. `CROSS JOIN UNNEST(t.arr)`), so unlike a real table it can't
+                # be scanned as an independent Step - there's no single, fixed
+                # table to hand a dependency-free Scan step; the array to explode
+                # differs per outer row, exactly like a LATERAL join. Stash the raw
+                # Unnest node instead of adding a Scan dependency;
+                # PythonExecutor.join evaluates it directly against each row of the
+                # join accumulated so far.
+                step.joins[alias_]["unnest"] = join.this
+            else:
+                step.add_dependency(Scan.from_expression(join.this, ctes))
 
         return step
 
