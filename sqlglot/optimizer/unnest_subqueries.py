@@ -160,7 +160,11 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
         if column.find_ancestor(exp.Where) is not where:
             return
 
-        predicate = column.find_ancestor(exp.Predicate)
+        # exp.ArrayContains is a boolean-valued predicate (e.g. CONTAINS(...)) that,
+        # unlike EQ/GT/etc, isn't itself an exp.Predicate, so find_ancestor(exp.Predicate)
+        # would otherwise skip over it and land on some unrelated Predicate ancestor
+        # further up (e.g. the enclosing EXISTS) instead of the actual correlating condition.
+        predicate = column.find_ancestor(exp.Predicate, exp.ArrayContains)
 
         if not predicate or predicate.find_ancestor(exp.Where) is not where:
             return
@@ -176,7 +180,7 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
 
         keys.append((key, column, predicate))
 
-    if not any(isinstance(predicate, exp.EQ) for *_, predicate in keys):
+    if not keys:
         return
 
     is_subquery_projection = any(

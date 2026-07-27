@@ -7,13 +7,12 @@ Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). Most gaps found during that survey have been
+the newly-supported construct). All gaps found during that survey have been
 fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
 pyproject.toml while it's under active development) and are kept below as
-plain regression guards; one is still open - a correlated NOT EXISTS
-subquery generates invalid Python - pending a fix upstream. That fixed set
-includes one genuine regression (not a new gap): a since-landed fix for a
-narrow nested-derived-table case briefly broke plain chained CTEs (see
+plain regression guards, including one genuine regression (not a new gap):
+a since-landed fix for a narrow nested-derived-table case briefly broke
+plain chained CTEs (see
 test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
 for real.
 """
@@ -756,19 +755,22 @@ def test_recursive_cte():
 # hood) - see coverage.py's module docstring. `optimize()` normally
 # decorrelates an `EXISTS`/`NOT EXISTS` subquery into a semi-join the planner
 # can execute; skip that rewrite (as sqlcov's pipeline does) and the raw
-# `exp.Exists` node falls through to a codegen path with no real Python
-# transform for it - it emits the subquery's own SQL text verbatim
+# `exp.Exists` node used to fall through to a codegen path with no real
+# Python transform for it - it emitted the subquery's own SQL text verbatim
 # (`not EXISTS(SELECT 1 FROM "u" AS "u" WHERE ...)`), which isn't valid
 # Python, raising a bare `SyntaxError` at row-eval time. `execute()`'s own
-# tests don't hit this because `execute()` calls full `optimize()` first,
-# decorrelating the subquery away before this ever matters - this test uses
-# the qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
-# coverage.py, to exercise the code path sqlcov actually runs.
+# tests never hit this because `execute()` calls full `optimize()` first,
+# decorrelating the subquery away before this ever mattered - this test
+# uses the qualify/annotate_types/Plan/PythonExecutor pipeline directly,
+# mirroring coverage.py, to exercise the code path sqlcov actually runs.
 #
 # Found stress-testing sqlcov against a real Athena CTAS: `WHERE NOT
 # EXISTS(SELECT 1 FROM h_inrr_tmp AS sub WHERE CONTAINS(sub.visited_ids,
 # inrr_tmp.next_id))` - filtering out rows already reachable from another
-# row's visited-id history.
+# row's visited-id history. Fixed upstream; kept as a regression guard.
+# NOTE: the bare correlated case here is fixed, but the production query's
+# exact shape still fails differently as of this writing - see
+# test_correlated_not_exists_with_array_contains below.
 
 
 def test_correlated_not_exists_subquery():
@@ -783,5 +785,53 @@ def test_correlated_not_exists_subquery():
     )
     tree = annotate_types(tree, schema=schema, dialect="presto")
     tables = ensure_tables({"t": [{"id": 1}, {"id": 2}], "u": [{"id": 1}]}, dialect="presto")
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(2,)]
+
+
+# --- Fixed: a correlated NOT EXISTS subquery whose condition is CONTAINS ---
+# A more specific variant of the already-fixed test_correlated_not_exists_subquery
+# above, not covered by that fix: the bare-equality correlated NOT EXISTS
+# compiled fine, but the production query's exact shape - the subquery's
+# WHERE is `CONTAINS(array_column, outer_column)`, not a plain equality -
+# still failed the same way: `not EXISTS(SELECT 1 FROM "u" AS "u" WHERE
+# ARRAYCONTAINS(scope["u"]["arr"], scope["t"]["id"])), line 1` was emitted as
+# literal SQL/pseudo-Python text rather than valid Python, raising the
+# identical `SyntaxError`.
+#
+# Root cause: `unnest_subqueries.decorrelate` located the correlating
+# predicate for an external column via `column.find_ancestor(exp.Predicate)`.
+# `CONTAINS(...)` parses to `exp.ArrayContains`, which - unlike EQ/GT/etc -
+# is a plain `Binary`/`Func`, not an `exp.Predicate`, so the lookup walked
+# straight past it and landed on the enclosing `EXISTS` instead, which isn't
+# a `Binary`, so decorrelation bailed out and left the raw correlated
+# `exp.Exists` node for the (nonexistent) SQL-text codegen path to choke on.
+# Separately, decorrelation as a whole required at least one equality key
+# among the correlated columns before doing anything, which a bare
+# `CONTAINS` predicate (with no equi-join key at all) could never satisfy.
+#
+# Fixed by teaching the predicate lookup to also recognize `exp.ArrayContains`
+# as a correlating condition, and loosening the "needs an EQ key" gate to
+# "needs at least one key of any kind" - the existing non-equality-key
+# machinery (aggregate the array, then `ARRAY_ANY(nested, _x -> CONTAINS(_x,
+# outer_column))`) already handled the rest correctly once it was reachable.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: `WHERE NOT
+# EXISTS(SELECT 1 FROM h_inrr_tmp AS sub WHERE CONTAINS(sub.visited_ids,
+# inrr_tmp.next_id))` - the exact production shape.
+
+
+def test_correlated_not_exists_with_array_contains():
+    schema = {"t": {"id": "BIGINT"}, "u": {"arr": "ARRAY<BIGINT>"}}
+    tree = qualify(
+        sqlglot.parse_one(
+            "SELECT t.id FROM t WHERE NOT EXISTS(SELECT 1 FROM u WHERE CONTAINS(u.arr, t.id))",
+            dialect="presto",
+        ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables({"t": [{"id": 1}, {"id": 2}], "u": [{"arr": [1, 3]}]}, dialect="presto")
     result = PythonExecutor(tables=tables).execute(Plan(tree))
     assert sorted(result.rows) == [(2,)]
