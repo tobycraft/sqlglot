@@ -3,18 +3,18 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here are marked ``xfail(strict=True)``, asserting the
+Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). All gaps found during that survey have been
-fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
-pyproject.toml while it's under active development) and are kept below as
-plain regression guards. That fixed set includes one genuine regression (not
-a new gap): a
-since-landed fix for a narrow nested-derived-table case briefly broke plain
-chained CTEs (see test_chained_ctes_regressed_by_nested_derived_table_fix)
-before being fixed for real.
+the newly-supported construct). There are none open right now - every gap
+found during that survey has been fixed in the local sqlglot checkout
+(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
+development); the tests below are plain regression guards. That includes one
+genuine regression (not a new gap): a since-landed fix for a narrow
+nested-derived-table case briefly broke plain chained CTEs (see
+test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
+for real.
 """
 
 from __future__ import annotations
@@ -592,7 +592,7 @@ def test_union_as_sole_content_of_derived_table():
     assert sorted(result.rows) == [(1,), (2,), (3,)]
 
 
-# --- Fixed: comparing a `datetime.date` against a `datetime.datetime` ------
+# --- Fixed: comparing a `datetime.date` against a `datetime.datetime` -------
 # Found stress-testing sqlcov against a real Athena CTAS, in two directions:
 # a date-dimension join filters on `sticky_date_dim_latest.first_day_of_month
 # >= CAST('2022-11-01' AS TIMESTAMP)` (a DATE column - loader.py only ever
@@ -603,11 +603,10 @@ def test_union_as_sole_content_of_derived_table():
 # a literal cast to DATE). Athena/Presto coerce a DATE/TIMESTAMP comparison
 # implicitly either way (a DATE reads as midnight on that day); the
 # executor's comparison operators (env.py's LT/GT/GE/LE, thin wrappers around
-# Python's own `<`/`>`/etc.) didn't, so both directions raised the identical
-# `TypeError: can't compare datetime.datetime to datetime.date` instead of
-# resolving the comparison. Fixed by widening the bare `date` side to
-# midnight on that day before comparing, in both GT/GTE/LT/LTE; parametrized
-# so the fix is checked against both directions.
+# Python's own `<`/`>`/etc.) used to not, so both directions raised the
+# identical `TypeError: can't compare datetime.datetime to datetime.date`
+# instead of resolving the comparison. Fixed upstream; kept parametrized as a
+# regression guard covering both directions.
 
 _DATE_DATETIME_COMPARISON_CASES = [
     pytest.param(
@@ -634,3 +633,80 @@ _DATE_DATETIME_COMPARISON_CASES = [
 def test_date_datetime_comparison_does_not_coerce(sql, schema, rows, expected):
     res = execute(sql, tables={"t": rows}, schema=schema, dialect="athena")
     assert list(res.rows) == expected
+
+
+# --- Fixed: a "simple CASE with a subject" generated invalid Python ---------
+# sqlcov deliberately runs only `qualify()` + `annotate_types()` before
+# planning (not the full `optimize()` pipeline `execute()` uses under the
+# hood) - see coverage.py's module docstring. `optimize()`'s canonicalize
+# step normally rewrites a "simple CASE" (`CASE x WHEN v1 THEN r1 WHEN v2
+# THEN r2 END`, comparing a subject expression against each WHEN value) into
+# the equivalent "searched CASE" form (`CASE WHEN x = v1 THEN r1 ...  END`);
+# skip that rewrite (as sqlcov's pipeline does) and the raw simple-CASE node
+# used to generate each WHEN comparison using a literal `=` instead of
+# Python's `==` - a bare `SyntaxError` ("expected 'else' after 'if'
+# expression") at row-eval time, not a plan or execution error. Neither an
+# explicit ELSE nor a JOIN was needed to trigger it - a bare SELECT-list
+# simple CASE was enough. `execute()`'s own tests didn't hit this because
+# `execute()` calls full `optimize()` first, rewriting the simple CASE away
+# before this ever mattered - this test uses the qualify/annotate_types/
+# Plan/PythonExecutor pipeline directly, mirroring coverage.py, to exercise
+# the code path sqlcov actually runs.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: a JOIN condition
+# matching `ipd2.ipdt_product = CASE seed.product WHEN 'svr' THEN 'stvr'
+# WHEN 'bvr' THEN 'btb' END` - a bare SELECT-list simple CASE reproduces the
+# identical failure with no JOIN needed at all. Fixed upstream (the
+# PythonGenerator's `_case_sql` now emits `==` for the subject comparison);
+# kept as a regression guard.
+
+
+def test_simple_case_with_subject():
+    schema = {"seed": {"product": "VARCHAR"}}
+    tree = qualify(
+        sqlglot.parse_one(
+            "SELECT CASE seed.product WHEN 'svr' THEN 'stvr' WHEN 'bvr' THEN 'btb' END AS x "
+            "FROM seed",
+            dialect="presto",
+        ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables(
+        {"seed": [{"product": "svr"}, {"product": "bvr"}, {"product": "other"}]},
+        dialect="presto",
+    )
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows, key=lambda r: (r[0] is None, r[0])) == [
+        ("btb",),
+        ("stvr",),
+        (None,),
+    ]
+
+
+# --- Open: CROSS JOIN UNNEST of a column reference (not a literal array) ----
+# The already-fixed test_unnest_in_from_clause above covers `UNNEST(ARRAY[1,
+# 2, 3])` - a literal array needing no row context to evaluate.
+# `PythonExecutor.scan_unnest` evaluates the UNNEST expression against a
+# brand-new, completely empty static context - fine for a literal, but a
+# real column reference like `UNNEST(t.arr)` needs the *joined* row's own
+# context to resolve `t`, which is never wired in: a bare `KeyError` naming
+# the outer table, not a wrong answer.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: `FROM _opened_loans
+# CROSS JOIN UNNEST(_opened_loans.customer_set_latest) AS u(cust_id)` -
+# exploding an array-typed column from the joined CTE itself, not a literal.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="PythonExecutor: CROSS JOIN UNNEST(<column reference>) can't resolve the outer row",
+)
+def test_unnest_of_column_reference():
+    res = execute(
+        "SELECT t.id, u.x FROM t CROSS JOIN UNNEST(t.arr) AS u(x)",
+        tables={"t": [{"id": 1, "arr": [10, 20]}, {"id": 2, "arr": [30]}]},
+        dialect="presto",
+    )
+    assert sorted(res.rows) == [(1, 10), (1, 20), (2, 30)]
