@@ -35,6 +35,8 @@ class PythonExecutor:
 
                 if isinstance(node, planner.Scan):
                     contexts[node] = self.scan(node, context)
+                elif isinstance(node, planner.Window):
+                    contexts[node] = self.window(node, context)
                 elif isinstance(node, planner.Aggregate):
                     contexts[node] = self.aggregate(node, context)
                 elif isinstance(node, planner.Join):
@@ -230,6 +232,109 @@ class PythonExecutor:
                 table.append(a_row + b_row)
 
         return table
+
+    def window(self, step, context):
+        rows = [reader.row for reader, _ in context]
+        n = len(rows)
+        names = list(step.windows)
+
+        results = {name: [None] * n for name in names}
+
+        for name, window in step.windows.items():
+            func = window.this
+            partition_by = self.generate_tuple(window.args.get("partition_by"))
+            order = window.args.get("order")
+            order_by = self.generate_tuple(order.expressions if order else None)
+
+            partitions = collections.defaultdict(list)
+            for i in range(n):
+                context.set_index(i)
+                partitions[context.eval_tuple(partition_by)].append(i)
+
+            for indices in partitions.values():
+                keys = None
+
+                if order_by:
+                    evaluated = []
+                    for i in indices:
+                        context.set_index(i)
+                        evaluated.append((i, context.eval_tuple(order_by)))
+                    evaluated.sort(key=lambda pair: tuple((v is None, v) for v in pair[1]))
+                    indices = [i for i, _ in evaluated]
+                    keys = [key for _, key in evaluated]
+
+                for i, value in zip(indices, self._window_values(func, indices, keys, context)):
+                    results[name][i] = value
+
+        table = Table(list(context.columns) + names)
+        for i in range(n):
+            table.append(rows[i] + tuple(results[name][i] for name in names))
+
+        context = self.context({step.name: table, **{name: table for name in context.tables}})
+
+        if step.projections or step.condition:
+            return self.scan(step, context)
+        return context
+
+    def _window_values(self, func, indices, keys, context):
+        """Compute the values of a single window function across one partition.
+
+        `indices` are the row indices of the partition, already sorted by the window's
+        ORDER BY (if any); `keys` are the corresponding evaluated ORDER BY tuples.
+        """
+        width = len(indices)
+
+        if isinstance(func, exp.RowNumber):
+            return range(1, width + 1)
+
+        if isinstance(func, (exp.Rank, exp.DenseRank)):
+            dense = isinstance(func, exp.DenseRank)
+            values = []
+            prev_key = object()
+            rank = 0
+            for pos, key in enumerate(keys or [()] * width, start=1):
+                if key != prev_key:
+                    rank = rank + 1 if dense else pos
+                    prev_key = key
+                values.append(rank)
+            return values
+
+        if isinstance(func, (exp.Lag, exp.Lead)):
+            sign = -1 if isinstance(func, exp.Lag) else 1
+
+            if indices:
+                context.set_index(indices[0])
+            offset_expr = func.args.get("offset")
+            offset = context.eval(self.generate(offset_expr)) if offset_expr else 1
+            default_expr = func.args.get("default")
+            default = context.eval(self.generate(default_expr)) if default_expr else None
+
+            this = self.generate(func.this)
+            partition_values = []
+            for i in indices:
+                context.set_index(i)
+                partition_values.append(context.eval(this))
+
+            values = []
+            for pos in range(width):
+                src = pos + sign * offset
+                values.append(partition_values[src] if 0 <= src < width else default)
+            return values
+
+        agg = self.env.get(func.__class__.__name__.upper())
+        if agg is None:
+            raise NotImplementedError(f"Window function not supported: {func.sql()}")
+
+        if isinstance(func.this, exp.Star):
+            operands = [1] * width
+        else:
+            this = self.generate(func.this)
+            operands = []
+            for i in indices:
+                context.set_index(i)
+                operands.append(context.eval(this))
+
+        return [agg(operands)] * width
 
     def aggregate(self, step, context):
         group_by = self.generate_tuple(step.group.values())

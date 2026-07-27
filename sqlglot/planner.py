@@ -147,6 +147,8 @@ class Step:
         operands: dict[exp.Expr, str] = {}
         aggregations: dict[exp.Expr, None] = {}
         next_operand_name = name_sequence("_a_")
+        windows: dict[str, exp.Window] = {}
+        next_window_name = name_sequence("_w_")
 
         def extract_agg_operands(expression: exp.Expr) -> bool:
             agg_funcs = tuple(expression.find_all(exp.AggFunc))
@@ -169,7 +171,12 @@ class Step:
             step.aggregations = list(aggregations)
 
         for e in expression.expressions:
-            if e.find(exp.AggFunc):
+            window = e.find(exp.Window)
+            if window:
+                name = e.alias_or_name or next_window_name()
+                windows[name] = window
+                projections.append(exp.column(name, step.name, quoted=True))
+            elif e.find(exp.AggFunc):
                 projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
                 extract_agg_operands(e)
             else:
@@ -179,6 +186,14 @@ class Step:
 
         if where is not None:
             step.condition = where.this
+
+        if windows:
+            window_step = Window()
+            window_step.source = step.name
+            window_step.name = step.name
+            window_step.windows = windows
+            window_step.add_dependency(step)
+            step = window_step
 
         group: exp.Group | None = expression.args.get("group")
 
@@ -381,6 +396,21 @@ class Join(Step):
                 lines.append(f"{indent}Key: {join_key}")
             if join.get("condition"):
                 lines.append(f"{indent}On: {join['condition'].sql()}")  # type: ignore
+        return lines
+
+
+class Window(Step):
+    def __init__(self) -> None:
+        super().__init__()
+        self.windows: dict[str, exp.Window] = {}
+        self.source: str | None = None
+
+    def _to_s(self, indent: str) -> list[str]:
+        lines = [f"{indent}Windows:"]
+
+        for name, window in self.windows.items():
+            lines.append(f"{indent}  - {name}: {window.sql()}")
+
         return lines
 
 

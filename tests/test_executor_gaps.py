@@ -21,12 +21,17 @@ import datetime
 import pytest
 from sqlglot.executor import execute
 
-# --- Window functions: entirely unsupported ---------------------------------
-# exp.Window has no PythonGenerator transform, so it falls through to the
-# default, dialect-agnostic SQL generator, which emits the literal
-# "FUNC(...) OVER (...)" text. That text is then compiled as Python source,
-# which isn't valid Python - every window function fails the same way,
-# regardless of which one it is or whether it's an aggregate reused as one.
+# --- Window functions: fixed via a dedicated planner Step -------------------
+# exp.Window still has no PythonGenerator transform (its SQL can't be compiled
+# as a Python expression), so instead the planner now extracts window
+# expressions out of the projection list into a new Window step, inserted
+# between the source scan/join and any Aggregate/Sort step. PythonExecutor
+# evaluates each window spec by partitioning and (if present) ordering row
+# indices in Python, then computing ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD
+# directly or delegating aggregate window functions (SUM, AVG, ...) to the
+# existing ENV aggregators. This covers whole-partition and offset-based
+# functions; ORDER BY-dependent frames (e.g. a running SUM) are not
+# implemented since ROWS/RANGE frame bounds are ignored.
 
 _WINDOW_CASES = [
     pytest.param(
@@ -57,9 +62,6 @@ _WINDOW_CASES = [
 
 
 @pytest.mark.parametrize("sql, tables, expected", _WINDOW_CASES)
-@pytest.mark.xfail(
-    strict=True, reason="exp.Window has no PythonGenerator transform: SyntaxError on OVER (...)"
-)
 def test_window_function(sql, tables, expected):
     res = execute(sql, tables=tables, dialect="presto")
     assert sorted(res.rows) == sorted(expected)
