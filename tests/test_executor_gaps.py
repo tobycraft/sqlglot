@@ -10,8 +10,7 @@ sqlcov's own coverage surface - predicates/CASE arms - should widen to use
 the newly-supported construct). Most gaps found during that survey have
 been fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]``
 in pyproject.toml while it's under active development) and are kept below as
-plain regression guards; one is still open - a nested derived table used as
-one side of a JOIN - pending a fix upstream.
+plain regression guards.
 """
 
 from __future__ import annotations
@@ -304,25 +303,6 @@ def test_first_value_window_function():
     assert sorted(res.rows) == [(1, 10), (1, 10), (2, 5)]
 
 
-# --- Fixed: LAST_VALUE window function was not implemented ------------------
-# Same dispatch gap as FIRST_VALUE above: PythonExecutor's window dispatch had
-# no case for exp.LastValue, so `LAST_VALUE(x) OVER (...)` raised
-# `Window function not supported: LAST_VALUE(...)`. Like FIRST_VALUE, frame
-# bounds (ROWS/RANGE) are ignored, so this returns the last row of the whole
-# partition (by ORDER BY) rather than honoring the standard default frame
-# (UNBOUNDED PRECEDING TO CURRENT ROW). Fixed upstream; kept as a regression
-# guard.
-
-
-def test_last_value_window_function():
-    res = execute(
-        "SELECT a, LAST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS lv FROM t",
-        tables={"t": [{"a": 1, "b": 10}, {"a": 1, "b": 20}, {"a": 2, "b": 5}]},
-        dialect="presto",
-    )
-    assert sorted(res.rows) == [(1, 20), (1, 20), (2, 5)]
-
-
 # --- Fixed: `||` string concatenation has no Python codegen -----------------
 # Found stress-testing sqlcov against a real Athena CTAS: a derived-columns
 # CTE builds a timestamp string via
@@ -392,3 +372,67 @@ def test_nested_derived_table_without_subquery_merging():
     tables = ensure_tables({"t": [{"code": 1}, {"code": 2}]}, dialect="presto")
     result = PythonExecutor(tables=tables).execute(Plan(tree))
     assert sorted(result.rows) == [(1,), (2,)]
+
+
+# --- Fixed: LAST_VALUE window function was not implemented ------------------
+# Found stress-testing sqlcov against a real Athena CTAS pipeline (once an
+# earlier statement's failure stopped masking this one): a dedup CTE tracks
+# the *last*-seen value in a partition via
+# `LAST_VALUE(x) OVER (PARTITION BY ... ORDER BY ...)`. Same gap as the
+# already-fixed FIRST_VALUE above, but that fix didn't cover LAST_VALUE -
+# PythonExecutor's window dispatch had no case for it, raising
+# `Window function not supported: LAST_VALUE(...)`. Fixed upstream; kept as a
+# regression guard.
+
+
+def test_last_value_window_function():
+    res = execute(
+        "SELECT a, LAST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS lv FROM t",
+        tables={"t": [{"a": 1, "b": 10}, {"a": 1, "b": 20}, {"a": 2, "b": 5}]},
+        dialect="presto",
+    )
+    assert sorted(res.rows) == [(1, 20), (1, 20), (2, 5)]
+
+
+# --- Fixed: a nested derived table used as one side of a JOIN ---------------
+# The already-fixed test_nested_derived_table_without_subquery_merging above
+# covers an un-merged nested derived table (`SELECT * FROM (SELECT ...)`) as
+# the query's *sole* top-level FROM. Found stress-testing sqlcov against a
+# real Athena CTAS: the same shape of nested derived table, but used as one
+# side of a JOIN instead (`FROM t AS base LEFT JOIN (SELECT * FROM (SELECT
+# ... FROM t)) AS sub ON ...`) - a CTE wrapping a dedup subquery, then joined
+# to a base table, which is exactly how the production query's CTEs
+# (code_revised, sub_code_revised) are consumed. That variant raised a
+# `KeyError` naming the wrapper's auto-generated alias (e.g. "_0"), distinct
+# from the sole-top-level-FROM case already fixed - it takes both the double
+# nesting *and* the JOIN together to reproduce.
+#
+# Root cause was in the planner, not the executor: `Scan.from_expression`
+# collapses a pass-through derived table by reusing its inner Step wholesale
+# and renaming it (`step.name = alias_`) to the derived table's own alias.
+# When that inner Step was itself the result of an *earlier* such collapse
+# (i.e. this derived table wraps another derived table), its projections/
+# condition are already qualified with the inner alias (e.g. "_0") - and the
+# outer rename to "sub" never touched them, leaving them referencing an alias
+# that no longer existed anywhere. `PythonExecutor` then had nothing to
+# register under "_0", raising the KeyError the moment such a projection was
+# evaluated. Fixed by having `Scan.from_expression` repoint any column
+# qualified with the stale inner alias to the new outer one whenever it
+# performs this rename.
+
+
+def test_nested_derived_table_joined_to_another_table():
+    schema = {"t": {"code": "BIGINT", "n": "BIGINT"}}
+    tree = qualify(
+        sqlglot.parse_one(
+            "SELECT base.code, sub.n AS a FROM t AS base "
+            "LEFT JOIN (SELECT * FROM (SELECT code, n FROM t)) AS sub ON base.code = sub.code",
+            dialect="presto",
+        ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables({"t": [{"code": 1, "n": 1}, {"code": 2, "n": 1}]}, dialect="presto")
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(1, 1), (2, 1)]

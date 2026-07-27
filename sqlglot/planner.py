@@ -29,6 +29,14 @@ def _rewrite_filtered_aggs(expression: exp.Expr) -> None:
         filter_.replace(agg)
 
 
+def _rename_table_qualifier(expressions: t.Iterable[exp.Expr], old_name: str, new_name: str) -> None:
+    """Repoints columns qualified with `old_name` to `new_name` in-place."""
+    for expression in expressions:
+        for column in expression.find_all(exp.Column):
+            if column.table == old_name:
+                column.set("table", exp.to_identifier(new_name, quoted=True))
+
+
 class Plan:
     def __init__(self, expression: exp.Expr) -> None:
         self.expression: exp.Expr = expression.copy()
@@ -359,7 +367,19 @@ class Scan(Step):
         if isinstance(expression, exp.Subquery):
             table = expression.this
             step = Step.from_expression(table, ctes)
+            old_name = step.name
             step.name = alias_
+
+            if old_name and old_name != alias_:
+                # a pass-through derived table (`SELECT * FROM (...)`) reuses its
+                # inner Step wholesale, so if that inner Step was itself renamed
+                # to a now-stale alias (e.g. nesting another pass-through derived
+                # table one level deeper), its projections/condition are still
+                # qualified with that stale name; repoint them at the new one
+                _rename_table_qualifier(step.projections, old_name, alias_)
+                if step.condition:
+                    _rename_table_qualifier([step.condition], old_name, alias_)
+
             return step
 
         step = Scan()
