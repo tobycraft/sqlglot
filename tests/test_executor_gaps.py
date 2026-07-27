@@ -129,16 +129,16 @@ def test_date_diff_honors_unit():
 
 
 # --- UNNEST in FROM: a planner bug, not just a missing function ------------
-# This fails before any function lookup happens - the planner's join step
-# assumes every FROM-clause source is a real table and chokes on `exp.Unnest`
-# itself (`'Unnest' object has no attribute 'parts'`). Distinct from the
-# NameError-class gaps below because it's structural: no scalar function
-# workaround fixes it.
+# Fixed: the planner's join step used to assume every FROM-clause source was
+# a real table and choked on `exp.Unnest` itself (`'Unnest' object has no
+# attribute 'parts'`) when the executor tried to look it up in the schema.
+# PythonExecutor.scan_table now special-cases exp.Unnest, evaluating its
+# array expressions directly and materializing them into a Table instead of
+# looking them up in `self.tables`. This covers literal/uncorrelated UNNEST;
+# UNNEST expressions correlated to an outer row (e.g. `UNNEST(t.arr)`) are
+# still unsupported since that requires a lateral join, not just a table scan.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="UNNEST in FROM is not handled by the planner: AttributeError on exp.Unnest"
-)
 def test_unnest_in_from_clause():
     res = execute(
         "SELECT x FROM t CROSS JOIN UNNEST(ARRAY[1, 2, 3]) AS u(x)",

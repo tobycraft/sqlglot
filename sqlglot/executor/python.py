@@ -124,8 +124,28 @@ class PythonExecutor:
         return self.context({}), [RowReader(())]
 
     def scan_table(self, step):
+        if isinstance(step.source, exp.Unnest):
+            return self.scan_unnest(step)
+
         table = self.tables.find(step.source)
         context = self.context({step.source.alias_or_name: table})
+        return context, iter(table)
+
+    def scan_unnest(self, step):
+        unnest = step.source
+        static_context = self.context({})
+        arrays = [static_context.eval(self.generate(expression)) for expression in unnest.expressions]
+
+        offset = unnest.args.get("offset")
+        columns = [column.name for column in unnest.selects] or [
+            f"_col_{i}" for i in range(len(arrays) + bool(offset))
+        ]
+
+        table = Table(columns)
+        for i, values in enumerate(itertools.zip_longest(*arrays)):
+            table.append(values + (i + 1,) if offset else values)
+
+        context = self.context({step.name: table})
         return context, iter(table)
 
     def join(self, step, context):
