@@ -7,12 +7,11 @@ Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). Most gaps found during that survey have been
+the newly-supported construct). All gaps found during that survey have been
 fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
 pyproject.toml while it's under active development) and are kept below as
-plain regression guards; one is still open - a DATE column compared against
-a CAST(... AS TIMESTAMP) literal doesn't coerce - pending a fix upstream.
-That fixed set includes one genuine regression (not a new gap): a
+plain regression guards. That fixed set includes one genuine regression (not
+a new gap): a
 since-landed fix for a narrow nested-derived-table case briefly broke plain
 chained CTEs (see test_chained_ctes_regressed_by_nested_derived_table_fix)
 before being fixed for real.
@@ -591,3 +590,47 @@ def test_union_as_sole_content_of_derived_table():
     )
     result = PythonExecutor(tables=tables).execute(Plan(tree))
     assert sorted(result.rows) == [(1,), (2,), (3,)]
+
+
+# --- Fixed: comparing a `datetime.date` against a `datetime.datetime` ------
+# Found stress-testing sqlcov against a real Athena CTAS, in two directions:
+# a date-dimension join filters on `sticky_date_dim_latest.first_day_of_month
+# >= CAST('2022-11-01' AS TIMESTAMP)` (a DATE column - loader.py only ever
+# produces `datetime.date`, never `datetime.datetime`, for a fixture column -
+# against a literal explicitly cast to TIMESTAMP); a later CASE guards on
+# `_derived_cols._creation_timestamp < CAST('2023-08-03' AS DATE)` (the
+# reverse: a computed `datetime.datetime`, from an earlier DATE_PARSE, against
+# a literal cast to DATE). Athena/Presto coerce a DATE/TIMESTAMP comparison
+# implicitly either way (a DATE reads as midnight on that day); the
+# executor's comparison operators (env.py's LT/GT/GE/LE, thin wrappers around
+# Python's own `<`/`>`/etc.) didn't, so both directions raised the identical
+# `TypeError: can't compare datetime.datetime to datetime.date` instead of
+# resolving the comparison. Fixed by widening the bare `date` side to
+# midnight on that day before comparing, in both GT/GTE/LT/LTE; parametrized
+# so the fix is checked against both directions.
+
+_DATE_DATETIME_COMPARISON_CASES = [
+    pytest.param(
+        "SELECT d FROM t WHERE d >= CAST('2022-11-01' AS TIMESTAMP)",
+        {"t": {"d": "DATE"}},
+        [{"d": datetime.date(2022, 12, 1)}, {"d": datetime.date(2022, 1, 1)}],
+        [(datetime.date(2022, 12, 1),)],
+        id="date_column_ge_timestamp_cast_literal",
+    ),
+    pytest.param(
+        "SELECT CASE WHEN d < CAST('2023-08-03' AS DATE) THEN 0 ELSE 1 END AS x FROM t",
+        None,
+        [
+            {"d": datetime.datetime(2023, 8, 1, 10, 0)},
+            {"d": datetime.datetime(2023, 9, 1, 10, 0)},
+        ],
+        [(0,), (1,)],
+        id="computed_datetime_lt_date_cast_literal",
+    ),
+]
+
+
+@pytest.mark.parametrize("sql, schema, rows, expected", _DATE_DATETIME_COMPARISON_CASES)
+def test_date_datetime_comparison_does_not_coerce(sql, schema, rows, expected):
+    res = execute(sql, tables={"t": rows}, schema=schema, dialect="athena")
+    assert list(res.rows) == expected

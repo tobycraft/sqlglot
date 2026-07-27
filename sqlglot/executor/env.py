@@ -33,6 +33,32 @@ def filter_nulls(func, empty_null=True):
     return _func
 
 
+def coerce_date_and_datetime(func):
+    """
+    Decorator for binary comparison functions that lets a `datetime.date` compare
+    against a `datetime.datetime` by widening the date to midnight on that day, the
+    same implicit coercion Presto/Athena apply to DATE/TIMESTAMP comparisons.
+    """
+
+    @wraps(func)
+    def _func(this, e):
+        if (
+            isinstance(this, datetime.date)
+            and not isinstance(this, datetime.datetime)
+            and isinstance(e, datetime.datetime)
+        ):
+            this = datetime.datetime(this.year, this.month, this.day)
+        elif (
+            isinstance(e, datetime.date)
+            and not isinstance(e, datetime.datetime)
+            and isinstance(this, datetime.datetime)
+        ):
+            e = datetime.datetime(e.year, e.month, e.day)
+        return func(this, e)
+
+    return _func
+
+
 def null_if_any(*required):
     """
     Decorator that makes a function return `None` if any of the `required` arguments are `None`.
@@ -425,8 +451,8 @@ ENV = {
     "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),
     "FLATTEN": null_if_any(lambda arr: [x for sub in arr for x in sub]),
     "GREATEST": null_if_any(lambda *args: max(args)),
-    "GT": null_if_any(lambda this, e: this > e),
-    "GTE": null_if_any(lambda this, e: this >= e),
+    "GT": null_if_any(coerce_date_and_datetime(lambda this, e: this > e)),
+    "GTE": null_if_any(coerce_date_and_datetime(lambda this, e: this >= e)),
     "IF": lambda predicate, true, false: true if predicate else false,
     "INTDIV": null_if_any(lambda e, this: e // this),
     "INTERVAL": interval,
@@ -439,8 +465,8 @@ ENV = {
         lambda this, e: bool(re.match(e.replace("_", ".").replace("%", ".*"), this))
     ),
     "LOWER": null_if_any(lambda arg: arg.lower()),
-    "LT": null_if_any(lambda this, e: this < e),
-    "LTE": null_if_any(lambda this, e: this <= e),
+    "LT": null_if_any(coerce_date_and_datetime(lambda this, e: this < e)),
+    "LTE": null_if_any(coerce_date_and_datetime(lambda this, e: this <= e)),
     "MAP": null_if_any(lambda *args: dict(zip(*args))),  # type: ignore
     "MOD": null_if_any(lambda e, this: e % this),
     "MUL": null_if_any(lambda e, this: e * this),
