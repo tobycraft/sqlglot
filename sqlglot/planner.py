@@ -396,6 +396,16 @@ class Scan(Step):
             # dependency" path (see PythonExecutor.scan) evaluate the outer
             # projections against the inner Step's real, already-computed
             # output, exactly as it already does for a CTE reference.
+            # A SetOperation Step (UNION/INTERSECT/EXCEPT) never names itself
+            # (see SetOperation.from_expression - only its `left`/`right`
+            # dependencies get names) since it's normally consumed directly by
+            # a Join/Aggregate/etc. that references it by whatever name that
+            # caller assigns. Here it's the derived table's own inner content,
+            # so give it one - `step.source` below needs an actual name to
+            # depend on, or `PythonExecutor.scan` reads a `None` source as
+            # "no FROM at all" and builds an empty static context instead.
+            inner.name = inner.name or alias_
+
             step = Scan()
             step.name = alias_
             step.source = inner.name

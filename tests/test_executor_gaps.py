@@ -3,18 +3,19 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
+Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). There are none open right now - every gap
-found during that survey has been fixed in the local sqlglot checkout
-(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
-development); the tests below are plain regression guards. That includes one
-genuine regression (not a new gap): a since-landed fix for a narrow
-nested-derived-table case briefly broke plain chained CTEs (see
-test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
-for real.
+the newly-supported construct). Most gaps found during that survey have been
+fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
+pyproject.toml while it's under active development) and are kept below as
+plain regression guards; one is still open - a DATE column compared against
+a CAST(... AS TIMESTAMP) literal doesn't coerce - pending a fix upstream.
+That fixed set includes one genuine regression (not a new gap): a
+since-landed fix for a narrow nested-derived-table case briefly broke plain
+chained CTEs (see test_chained_ctes_regressed_by_nested_derived_table_fix)
+before being fixed for real.
 """
 
 from __future__ import annotations
@@ -551,3 +552,42 @@ def test_renamed_column_in_unmerged_derived_table():
     tables = ensure_tables({"t": [{"code": 1}, {"code": 2}]}, dialect="presto")
     result = PythonExecutor(tables=tables).execute(Plan(tree))
     assert sorted(result.rows) == [(1,), (2,)]
+
+
+# --- Fixed: a UNION as the sole content of a derived table -------------------
+# A fresh gap surfaced by the fix above: wiring the inner Step in as a
+# dependency via `step.source = inner.name` assumed `inner` always has a
+# name. It doesn't when the derived table's body is a `UNION`/`INTERSECT`/
+# `EXCEPT` - `SetOperation.from_expression` names its `left`/`right`
+# dependencies but never names the SetOperation Step itself, since it's
+# normally consumed directly by whatever references it by its own name. Left
+# unnamed, `step.source` ended up `None`, and `PythonExecutor.scan` reads a
+# `None` source as "no FROM at all", building an empty static context - the
+# derived table's Scan step then found zero tables to read a column list
+# from: `IndexError: list index out of range`.
+#
+# Fixed by giving the inner SetOperation Step a fallback name (its own
+# derived-table alias) when it doesn't already have one, mirroring this
+# file's existing `left.name = left.name or "left"` idiom.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: a derived table
+# merging two differently-sourced result sets row-wise (`FROM (SELECT ...
+# UNION ALL SELECT ...) AS base`), immediately after the previous fix landed.
+
+
+def test_union_as_sole_content_of_derived_table():
+    schema = {"t": {"code": "BIGINT"}, "t2": {"code": "BIGINT"}}
+    tree = qualify(
+        sqlglot.parse_one(
+            "SELECT base.code FROM (SELECT code FROM t UNION ALL SELECT code FROM t2) AS base",
+            dialect="presto",
+        ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables(
+        {"t": [{"code": 1}, {"code": 2}], "t2": [{"code": 3}]}, dialect="presto"
+    )
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(1,), (2,), (3,)]
