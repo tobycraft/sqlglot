@@ -321,6 +321,15 @@ class PythonExecutor:
                 values.append(partition_values[src] if 0 <= src < width else default)
             return values
 
+        if isinstance(func, exp.FirstValue):
+            this = self.generate(func.this)
+            if indices:
+                context.set_index(indices[0])
+                value = context.eval(this)
+            else:
+                value = None
+            return [value] * width
+
         agg = self.env.get(func.__class__.__name__.upper())
         if agg is None:
             raise NotImplementedError(f"Window function not supported: {func.sql()}")

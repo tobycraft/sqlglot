@@ -3,14 +3,16 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
+Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). There are none open right now - every gap
-found during that survey has been fixed in the local sqlglot checkout
-(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
-development); the tests below are plain regression guards.
+the newly-supported construct). Most gaps found during that survey have
+already been fixed in the local sqlglot checkout (tracked via
+``[tool.uv.sources]`` in pyproject.toml while it's under active development)
+and are kept below as plain regression guards; two are still open -
+INTERVAL MONTH arithmetic and un-merged nested derived tables - pending a
+fix upstream.
 """
 
 from __future__ import annotations
@@ -285,16 +287,15 @@ def test_previously_missing_function(expr, row, expected):
     assert list(res.rows) == [(expected,)]
 
 
-# --- Open: FIRST_VALUE window function is not implemented -------------------
+# --- Fixed: FIRST_VALUE window function was not implemented -----------------
 # Found stress-testing sqlcov against a real Athena CTAS pipeline: a dedup CTE
 # that carries the first-seen value forward via
 # `FIRST_VALUE(x) OVER (PARTITION BY ... ORDER BY ...)`. Every window function
-# in _WINDOW_CASES above works; FIRST_VALUE specifically raises
+# in _WINDOW_CASES above worked; FIRST_VALUE specifically raised
 # `Window function not supported: FIRST_VALUE(...)` - PythonExecutor's window
-# dispatch has no case for it.
+# dispatch had no case for it. Fixed upstream; kept as a regression guard.
 
 
-@pytest.mark.xfail(strict=True, reason="PythonExecutor: FIRST_VALUE window function not supported")
 def test_first_value_window_function():
     res = execute(
         "SELECT a, FIRST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS fv FROM t",
@@ -308,7 +309,7 @@ def test_first_value_window_function():
 # Found stress-testing sqlcov against a real Athena CTAS: a derived-columns
 # CTE builds a timestamp string via
 # `DATE_PARSE(CAST(d AS VARCHAR) || SUBSTR(t, 12), ...)`. The `||` operator
-# (exp.DPipe under presto/athena) compiles to a call to a Python-env function
+# (exp.DPipe under presto/athena) compiled to a call to a Python-env function
 # named "DPIPE", which sqlglot.executor.env.ENV had no entry for - a bare
 # NameError at row-eval time, not a parse or plan error. Fixed upstream; kept
 # as a regression guard.
