@@ -188,9 +188,39 @@ def ordered(this, desc, nulls_first):
     return this
 
 
+class _MonthsDelta:
+    """A `timedelta`-like duration for MONTH/QUARTER/YEAR intervals.
+
+    These units aren't a fixed number of days (`datetime.timedelta` has no
+    `months` parameter), so adding/subtracting one has to shift the calendar
+    month-by-month (via `_add_months`) instead.
+    """
+
+    __slots__ = ("months",)
+
+    def __init__(self, months):
+        self.months = months
+
+    def __neg__(self):
+        return _MonthsDelta(-self.months)
+
+    def __add__(self, other):
+        return _as_date(other, _add_months(_as_datetime(other), self.months))
+
+    __radd__ = __add__
+
+    def __rsub__(self, other):
+        return _as_date(other, _add_months(_as_datetime(other), -self.months))
+
+
 @null_if_any
 def interval(this, unit):
-    plural = unit + "S"
+    unit = unit.lower()
+    if unit in ("year", "quarter", "month"):
+        months = int(float(this)) * (12 if unit == "year" else 3 if unit == "quarter" else 1)
+        return _MonthsDelta(months)
+
+    plural = (unit + "s").upper()
     if plural in Generator.TIME_PART_SINGULARS:
         unit = plural
     return datetime.timedelta(**{unit.lower(): float(this)})
@@ -199,6 +229,8 @@ def interval(this, unit):
 def _as_datetime(value):
     if isinstance(value, datetime.datetime):
         return value
+    if isinstance(value, str):
+        return datetime.datetime.fromisoformat(value)
     return datetime.datetime(value.year, value.month, value.day)
 
 
@@ -251,6 +283,8 @@ def datediff(this, expression, unit="day"):
 
 
 def _as_date(this, result):
+    if isinstance(this, str):
+        return result.date() if len(this) <= len("YYYY-MM-DD") else result
     if isinstance(this, datetime.date) and not isinstance(this, datetime.datetime):
         return result.date()
     return result

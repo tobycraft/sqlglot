@@ -322,18 +322,18 @@ def test_string_concat_operator():
     assert list(res.rows) == [("foobar",)]
 
 
-# --- Open: date + INTERVAL 'n' MONTH arithmetic -----------------------------
+# --- Fixed: date + INTERVAL 'n' MONTH arithmetic ----------------------------
 # Found stress-testing sqlcov against a real Athena CTAS computing a
 # schedule's end date as `start_date + INTERVAL '1' MONTH + INTERVAL '-1' DAY`.
-# A DAY interval works fine (it's a fixed duration), but a MONTH interval
-# compiles to `datetime.timedelta(months=...)` - and `timedelta` has no
+# A DAY interval worked fine (it's a fixed duration), but a MONTH interval
+# used to compile to `datetime.timedelta(months=...)` - and `timedelta` has no
 # `months` parameter (months aren't a fixed number of days), raising
-# `TypeError: 'months' is an invalid keyword argument for __new__()`.
+# `TypeError: 'months' is an invalid keyword argument for __new__()`. Fixed
+# upstream by having MONTH/QUARTER/YEAR intervals produce a `_MonthsDelta`
+# that shifts the calendar instead of a `timedelta`; kept as a regression
+# guard.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="PythonExecutor: INTERVAL MONTH arithmetic misuses datetime.timedelta"
-)
 def test_date_plus_interval_month():
     res = execute(
         "SELECT d + INTERVAL '1' MONTH AS x FROM t",
