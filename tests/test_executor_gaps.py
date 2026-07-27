@@ -3,7 +3,7 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps, if any, are marked ``xfail(strict=True)``, asserting the
+Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
@@ -20,13 +20,42 @@ import datetime
 import pytest
 from sqlglot.executor import execute
 
-# --- Fixed: bare DATE(...) constructor under the athena dialect -------------
+# --- Fixed: DATE_TRUNC on a window-aggregate result -------------------------
+# DATE_TRUNC(unit, MIN(d) OVER (...)) - i.e. applied to a window aggregate's
+# result rather than a plain column - gets canonicalized to exp.TimestampTrunc
+# instead of exp.DateTrunc, since the builder only recognizes a direct
+# `CAST(... AS DATE)` as a date-typed argument. sqlglot.executor.env.ENV had
+# "DATETRUNC" (fixed previously) but no "TIMESTAMPTRUNC", so it raised
+# NameError. Found stress-testing sqlcov against a real Athena CTAS:
+# `DATE_TRUNC('month', MIN(...) OVER (...))`. Fixed upstream; kept as a
+# regression guard.
+
+
+def test_date_trunc_over_window_aggregate():
+    sql = """
+WITH a AS (
+  SELECT g, MIN(d) OVER (PARTITION BY g) AS min_d FROM t
+)
+SELECT DATE_TRUNC('month', min_d) AS x FROM a
+"""
+    tables = {
+        "t": [
+            {"g": 1, "d": datetime.date(2025, 1, 31)},
+            {"g": 1, "d": datetime.date(2025, 2, 10)},
+        ]
+    }
+    schema = {"t": {"g": "BIGINT", "d": "DATE"}}
+    res = execute(sql, schema=schema, tables=tables, dialect="athena")
+    assert sorted(res.rows) == [(datetime.date(2025, 1, 1),), (datetime.date(2025, 1, 1),)]
+
+
+# --- Fixed: bare DATE(...) constructor under the athena dialect ------------
 # Under "athena", DATE(x) parses to its own exp.Date node (rather than
 # normalizing to CAST(x AS DATE), the way it does under "presto"), and
-# sqlglot.executor.env.ENV had no "DATE" entry - so it raised NameError the
-# moment a row was evaluated. Found stress-testing sqlcov against a real
-# Athena CTAS: `DATE(('2025-11-30'))` in a CASE guard. Fixed upstream; kept as
-# a regression guard.
+# sqlglot.executor.env.ENV used to have no "DATE" entry - raising NameError
+# the moment a row was evaluated. Found stress-testing sqlcov against a real
+# Athena CTAS: `DATE(('2025-11-30'))` in a CASE guard. Fixed upstream; kept
+# as a regression guard.
 
 
 def test_date_constructor_under_athena_dialect():

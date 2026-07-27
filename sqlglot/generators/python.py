@@ -84,6 +84,12 @@ def _date_add_sql(self, e: exp.DateAdd) -> str:
     return f"DATEADD({this}, {expression}, {unit!r})"
 
 
+def _timestamp_trunc_sql(self, e: exp.TimestampTrunc) -> str:
+    this = self.sql(e, "this")
+    unit = (e.text("unit") or "day").lower()
+    return f"TIMESTAMPTRUNC({this}, {unit!r})"
+
+
 def _div_sql(self: generator.Generator, e: exp.Div) -> str:
     denominator = self.sql(e, "expression")
 
@@ -134,4 +140,5 @@ class PythonGenerator(generator.Generator):
         exp.Or: lambda self, e: self.binary(e, "or"),
         exp.Ordered: _ordered_py,
         exp.Star: lambda *_: "1",
+        exp.TimestampTrunc: _timestamp_trunc_sql,
     }

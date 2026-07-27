@@ -294,6 +294,11 @@ def datetrunc(unit, this):
     return _as_date(this, result)
 
 
+@null_if_any("this", "unit")
+def timestamptrunc(this, unit):
+    return datetrunc(unit, this)
+
+
 @null_if_any("this", "expression")
 def dateadd(this, expression, unit="day"):
     unit = unit.lower()
@@ -376,6 +381,7 @@ ENV = {
     "DATEDIFF": datediff,
     "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
     "DATETRUNC": datetrunc,
+    "TIMESTAMPTRUNC": timestamptrunc,
     "DAYOFWEEKISO": null_if_any(lambda arg: arg.isoweekday()),
     "DIV": null_if_any(lambda e, this: e / this),
     "DOT": null_if_any(lambda e, this: e[this]),
