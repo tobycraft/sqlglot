@@ -3,14 +3,14 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here are marked ``xfail(strict=True)``, asserting the
+Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). Every other gap found during that survey has
-been fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]``
-in pyproject.toml while it's under active development); those tests are
-plain regression guards.
+the newly-supported construct). There are none open right now - every gap
+found during that survey has been fixed in the local sqlglot checkout
+(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
+development); the tests below are plain regression guards.
 """
 
 from __future__ import annotations
@@ -18,23 +18,27 @@ from __future__ import annotations
 import datetime
 
 import pytest
+import sqlglot
 from sqlglot.executor import execute
+from sqlglot.executor.python import PythonExecutor
+from sqlglot.executor.table import ensure_tables
+from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.planner import Plan
 
-# --- Fixed: an expression wrapping a window function, in the SAME select ----
+# --- Fixed: an expression wrapping a window function, in the SAME select ---
 # When a window function's result was consumed by another expression *within
 # the same SELECT that computes it* (comparison, arithmetic, CASE, even a
-# plain scalar function call), the planner matched on `e.find(exp.Window)` and
-# replaced the *entire* projection with a bare reference to the window's
-# value, silently discarding the wrapping expression - no error, just a wrong
-# number. This is distinct from test_date_trunc_over_window_aggregate below,
-# which wraps a window result that was already materialized as a plain column
-# by an *earlier* CTE/step - that case worked fine; only same-select wrapping
-# was affected. Found this way stress-testing sqlcov: a CASE guarding on
-# `SUM(x) OVER (PARTITION BY ...)` in the same CTE that computes the sum
-# silently returned the sum itself (always truthy), miscounting every arm.
-# Fixed upstream by rewriting each window reference in place to a column
-# pointing at its computed value, and keeping the wrapping expression as the
-# projection; kept as a regression guard.
+# plain scalar function call), the wrapping expression used to be silently
+# discarded, and the projection returned the raw, un-wrapped window value
+# instead - no error, just a wrong number. This was distinct from
+# test_date_trunc_over_window_aggregate below, which wraps a window result
+# that was already materialized as a plain column by an *earlier* CTE/step -
+# that case always worked; only same-select wrapping was affected. Found this
+# way stress-testing sqlcov: a CASE guarding on `SUM(x) OVER (PARTITION BY
+# ...)` in the same CTE that computes the sum silently returned the sum
+# itself (always truthy), miscounting every arm. Fixed upstream; kept as a
+# regression guard.
 
 _WINDOW_WRAPPED_CASES = [
     pytest.param(
@@ -279,3 +283,99 @@ _PREVIOUSLY_MISSING_FUNCTION_CASES = [
 def test_previously_missing_function(expr, row, expected):
     res = execute(f"SELECT {expr} AS x FROM t", tables={"t": [row]}, dialect="presto")
     assert list(res.rows) == [(expected,)]
+
+
+# --- Open: FIRST_VALUE window function is not implemented -------------------
+# Found stress-testing sqlcov against a real Athena CTAS pipeline: a dedup CTE
+# that carries the first-seen value forward via
+# `FIRST_VALUE(x) OVER (PARTITION BY ... ORDER BY ...)`. Every window function
+# in _WINDOW_CASES above works; FIRST_VALUE specifically raises
+# `Window function not supported: FIRST_VALUE(...)` - PythonExecutor's window
+# dispatch has no case for it.
+
+
+@pytest.mark.xfail(strict=True, reason="PythonExecutor: FIRST_VALUE window function not supported")
+def test_first_value_window_function():
+    res = execute(
+        "SELECT a, FIRST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS fv FROM t",
+        tables={"t": [{"a": 1, "b": 10}, {"a": 1, "b": 20}, {"a": 2, "b": 5}]},
+        dialect="presto",
+    )
+    assert sorted(res.rows) == [(1, 10), (1, 10), (2, 5)]
+
+
+# --- Fixed: `||` string concatenation has no Python codegen -----------------
+# Found stress-testing sqlcov against a real Athena CTAS: a derived-columns
+# CTE builds a timestamp string via
+# `DATE_PARSE(CAST(d AS VARCHAR) || SUBSTR(t, 12), ...)`. The `||` operator
+# (exp.DPipe under presto/athena) compiles to a call to a Python-env function
+# named "DPIPE", which sqlglot.executor.env.ENV had no entry for - a bare
+# NameError at row-eval time, not a parse or plan error. Fixed upstream; kept
+# as a regression guard.
+
+
+def test_string_concat_operator():
+    res = execute(
+        "SELECT a || b AS x FROM t", tables={"t": [{"a": "foo", "b": "bar"}]}, dialect="presto"
+    )
+    assert list(res.rows) == [("foobar",)]
+
+
+# --- Open: date + INTERVAL 'n' MONTH arithmetic -----------------------------
+# Found stress-testing sqlcov against a real Athena CTAS computing a
+# schedule's end date as `start_date + INTERVAL '1' MONTH + INTERVAL '-1' DAY`.
+# A DAY interval works fine (it's a fixed duration), but a MONTH interval
+# compiles to `datetime.timedelta(months=...)` - and `timedelta` has no
+# `months` parameter (months aren't a fixed number of days), raising
+# `TypeError: 'months' is an invalid keyword argument for __new__()`.
+
+
+@pytest.mark.xfail(
+    strict=True, reason="PythonExecutor: INTERVAL MONTH arithmetic misuses datetime.timedelta"
+)
+def test_date_plus_interval_month():
+    res = execute(
+        "SELECT d + INTERVAL '1' MONTH AS x FROM t",
+        tables={"t": [{"d": "2024-01-15"}]},
+        schema={"t": {"d": "DATE"}},
+        dialect="presto",
+    )
+    assert list(res.rows) == [(datetime.date(2024, 2, 15),)]
+
+
+# --- Open: an un-merged nested derived table breaks the planner ------------
+# sqlcov deliberately runs only `qualify()` + `annotate_types()` before
+# planning (not the full `optimize()` pipeline `execute()` uses under the
+# hood) - see coverage.py's module docstring - specifically so a predicate
+# like `x IN (1, 2)` isn't rewritten before it's tracked. `optimize()`'s
+# "merge subqueries" rule normally collapses a pass-through wrapper like
+# `SELECT * FROM (SELECT a FROM t)` into one Scan; skip that rule (as sqlcov's
+# pipeline does) and the *same* SQL, planned and executed the exact way
+# sqlcov does it, dies with a KeyError naming the wrapper's auto-generated
+# alias (e.g. "_0") - the Scan step for the outer SELECT looks the inner
+# derived table up in a tables map that was never populated for it. Found
+# stress-testing sqlcov against a real Athena CTAS whose CTEs nest several
+# unaliased derived tables (`SELECT * FROM (SELECT * FROM (...))`), which
+# Athena's own DDL exporter routinely emits and qualify() names `_innerN`.
+# `execute()`'s own tests all pass because `execute()` calls full `optimize()`
+# first, which erases the wrapper before this ever matters - this test uses
+# the qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
+# coverage.py, to exercise the code path sqlcov actually runs.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="PythonExecutor: KeyError scanning an un-merged nested derived table "
+    "(only hit when optimize()'s merge-subqueries rule is skipped, as sqlcov does)",
+)
+def test_nested_derived_table_without_subquery_merging():
+    schema = {"t": {"code": "BIGINT"}}
+    tree = qualify(
+        sqlglot.parse_one("SELECT * FROM (SELECT code FROM t)", dialect="presto"),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables({"t": [{"code": 1}, {"code": 2}]}, dialect="presto")
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(1,), (2,)]

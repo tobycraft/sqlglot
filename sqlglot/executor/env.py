@@ -385,6 +385,7 @@ ENV = {
     "DAYOFWEEKISO": null_if_any(lambda arg: arg.isoweekday()),
     "DIV": null_if_any(lambda e, this: e / this),
     "DOT": null_if_any(lambda e, this: e[this]),
+    "DPIPE": null_if_any(lambda this, e: this + e),
     "ENCODE": null_if_any(lambda this, charset="utf-8": this.encode(charset)),
     "EQ": null_if_any(lambda this, e: this == e),
     "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),
