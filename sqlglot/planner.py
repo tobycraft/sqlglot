@@ -6,6 +6,7 @@ import typing as t
 from sqlglot import alias, exp
 from sqlglot.helper import name_sequence
 from sqlglot.optimizer.eliminate_joins import join_condition
+from sqlglot.optimizer.unnest_subqueries import unnest_subqueries
 from collections.abc import Iterator, Sequence, Iterable
 
 
@@ -40,6 +41,12 @@ def _rename_table_qualifier(expressions: t.Iterable[exp.Expr], old_name: str, ne
 class Plan:
     def __init__(self, expression: exp.Expr) -> None:
         self.expression: exp.Expr = expression.copy()
+        # The executor has no codegen path for a correlated EXISTS/IN/scalar
+        # subquery (it would emit the subquery's own SQL text, not Python) -
+        # decorrelate it into a join here so a caller that skips the full
+        # `optimize()` pipeline (which already runs this rule) still gets a
+        # plannable tree. Idempotent on a tree that's already been unnested.
+        unnest_subqueries(self.expression)
         self.root: Step = Step.from_expression(self.expression)
         self._dag: dict[Step, set[Step]] = {}
 

@@ -10,11 +10,10 @@ sqlcov's own coverage surface - predicates/CASE arms - should widen to use
 the newly-supported construct). Most gaps found during that survey have been
 fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
 pyproject.toml while it's under active development) and are kept below as
-plain regression guards; one is still open - WITH RECURSIVE isn't supported
-at all, a genuinely bigger feature gap than the others here, not a small
-fix - pending a fix upstream. That fixed set includes one genuine
-regression (not a new gap): a since-landed fix for a narrow
-nested-derived-table case briefly broke plain chained CTEs (see
+plain regression guards; one is still open - a correlated NOT EXISTS
+subquery generates invalid Python - pending a fix upstream. That fixed set
+includes one genuine regression (not a new gap): a since-landed fix for a
+narrow nested-derived-table case briefly broke plain chained CTEs (see
 test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
 for real.
 """
@@ -710,15 +709,20 @@ def test_unnest_of_column_reference():
     assert sorted(res.rows) == [(1, 10), (1, 20), (2, 30)]
 
 
-# --- Fixed: WITH RECURSIVE is now supported ----------------------------------
-# planner.py/PythonExecutor previously had no concept of a self-referential
-# CTE at all - the whole design was a single-pass DAG of Steps, each
-# depending only on already-built ones, fundamentally incompatible with a
-# recursive term that reads from the very CTE it's still defining. Fixed by
-# adding a dedicated `RecursiveCTE` Step whose anchor/recursive-term subtrees
-# are run iteratively (anchor once, then the recursive term repeatedly
-# against the previous round's new rows, via a `RecursiveRef` placeholder)
-# rather than once each through the executor's generic flat-DAG dispatch.
+# --- Fixed: WITH RECURSIVE was not supported --------------------------------
+# planner.py/PythonExecutor used to have no concept of a self-referential
+# CTE at all - the whole design is a single-pass DAG of Steps, each
+# depending only on already-built ones, which was fundamentally incompatible
+# with a recursive term that reads from the very CTE it's still defining.
+# When the recursive branch's `FROM walk AS curr` got planned, "walk" wasn't
+# a registered table anywhere yet, so `self.tables.find(step.source)`
+# returned `None`, and the first attempt to read a column off it raised a
+# bare `AttributeError: 'NoneType' object has no attribute 'range_reader'` -
+# unlike most other gaps in this file, this wasn't a small codegen/wiring
+# fix; it needed genuine iterative evaluation (repeatedly running the
+# recursive term against the previous iteration's rows until it stops
+# producing new ones), a different execution model than the rest of this
+# executor. Fixed upstream; kept as a regression guard.
 #
 # Found stress-testing sqlcov against a real Athena CTAS: a `WITH RECURSIVE
 # walk(...)` chain walking a linked list of account-merge edges to its root.
@@ -744,3 +748,40 @@ def test_recursive_cte():
     # DISTINCT); from (2, 3), next_id=3 has no match in base, so recursion
     # stops there.
     assert sorted(res.rows) == [(1, 2), (2, 3), (2, 3)]
+
+
+# --- Open: a correlated NOT EXISTS subquery generates invalid Python -------
+# sqlcov deliberately runs only `qualify()` + `annotate_types()` before
+# planning (not the full `optimize()` pipeline `execute()` uses under the
+# hood) - see coverage.py's module docstring. `optimize()` normally
+# decorrelates an `EXISTS`/`NOT EXISTS` subquery into a semi-join the planner
+# can execute; skip that rewrite (as sqlcov's pipeline does) and the raw
+# `exp.Exists` node falls through to a codegen path with no real Python
+# transform for it - it emits the subquery's own SQL text verbatim
+# (`not EXISTS(SELECT 1 FROM "u" AS "u" WHERE ...)`), which isn't valid
+# Python, raising a bare `SyntaxError` at row-eval time. `execute()`'s own
+# tests don't hit this because `execute()` calls full `optimize()` first,
+# decorrelating the subquery away before this ever matters - this test uses
+# the qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
+# coverage.py, to exercise the code path sqlcov actually runs.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: `WHERE NOT
+# EXISTS(SELECT 1 FROM h_inrr_tmp AS sub WHERE CONTAINS(sub.visited_ids,
+# inrr_tmp.next_id))` - filtering out rows already reachable from another
+# row's visited-id history.
+
+
+def test_correlated_not_exists_subquery():
+    schema = {"t": {"id": "BIGINT"}, "u": {"id": "BIGINT"}}
+    tree = qualify(
+        sqlglot.parse_one(
+            "SELECT t.id FROM t WHERE NOT EXISTS(SELECT 1 FROM u WHERE u.id = t.id)",
+            dialect="presto",
+        ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables({"t": [{"id": 1}, {"id": 2}], "u": [{"id": 1}]}, dialect="presto")
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(2,)]
