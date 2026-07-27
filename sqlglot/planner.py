@@ -9,6 +9,26 @@ from sqlglot.optimizer.eliminate_joins import join_condition
 from collections.abc import Iterator, Sequence, Iterable
 
 
+def _rewrite_filtered_aggs(expression: exp.Expr) -> None:
+    """
+    Rewrites `AGG(x) FILTER (WHERE cond)` into `AGG(CASE WHEN cond THEN x END)`.
+
+    The executor has no way to evaluate `exp.Filter` (there's no PythonGenerator
+    transform for it), but every ENV aggregator already ignores `None`s, so folding
+    the filter condition into the aggregated value via `CASE WHEN` is equivalent and
+    lets the existing operand-extraction machinery handle it like any other operand.
+    """
+    for filter_ in expression.find_all(exp.Filter):
+        agg = filter_.this
+        condition = filter_.expression.this
+
+        value = agg.this
+        value = exp.Literal.number(1) if isinstance(value, exp.Star) else value.copy()
+
+        agg.set("this", exp.Case(ifs=[exp.If(this=condition.copy(), true=value)]))
+        filter_.replace(agg)
+
+
 class Plan:
     def __init__(self, expression: exp.Expr) -> None:
         self.expression: exp.Expr = expression.copy()
@@ -93,6 +113,7 @@ class Step:
         """
         ctes = ctes or {}
         expression = expression.unnest()
+        _rewrite_filtered_aggs(expression)
         with_: exp.With | None = expression.args.get("with_")
 
         # CTEs break the mold of scope and introduce themselves to all in the context.

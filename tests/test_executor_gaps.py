@@ -65,12 +65,13 @@ def test_window_function(sql, tables, expected):
     assert sorted(res.rows) == sorted(expected)
 
 
-# --- Aggregate FILTER clause: same failure mode as window functions --------
+# --- Aggregate FILTER clause -------------------------------------------------
+# Fixed: the planner now rewrites `AGG(x) FILTER (WHERE cond)` into
+# `AGG(CASE WHEN cond THEN x END)` before operand extraction, since every ENV
+# aggregator already ignores `None`s and exp.Filter itself has no
+# PythonGenerator transform.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="exp.Filter has no PythonGenerator transform: SyntaxError on FILTER (...)"
-)
 def test_aggregate_filter_clause():
     res = execute(
         "SELECT COUNT(*) FILTER (WHERE a > 1) AS c FROM t",
