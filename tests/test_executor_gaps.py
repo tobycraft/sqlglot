@@ -3,15 +3,17 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
+Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). There are none open right now - every gap
-found during that survey has been fixed in the local sqlglot checkout
-(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
-development); the tests below are plain regression guards. That includes one
-genuine regression (not a new gap): a since-landed fix for a narrow
+the newly-supported construct). Most gaps found during that survey have been
+fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
+pyproject.toml while it's under active development) and are kept below as
+plain regression guards; one is still open - WITH RECURSIVE isn't supported
+at all, a genuinely bigger feature gap than the others here, not a small
+fix - pending a fix upstream. That fixed set includes one genuine
+regression (not a new gap): a since-landed fix for a narrow
 nested-derived-table case briefly broke plain chained CTEs (see
 test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
 for real.
@@ -635,7 +637,7 @@ def test_date_datetime_comparison_does_not_coerce(sql, schema, rows, expected):
     assert list(res.rows) == expected
 
 
-# --- Fixed: a "simple CASE with a subject" generated invalid Python ---------
+# --- Fixed: a "simple CASE with a subject" generated invalid Python --------
 # sqlcov deliberately runs only `qualify()` + `annotate_types()` before
 # planning (not the full `optimize()` pipeline `execute()` uses under the
 # hood) - see coverage.py's module docstring. `optimize()`'s canonicalize
@@ -647,7 +649,7 @@ def test_date_datetime_comparison_does_not_coerce(sql, schema, rows, expected):
 # Python's `==` - a bare `SyntaxError` ("expected 'else' after 'if'
 # expression") at row-eval time, not a plan or execution error. Neither an
 # explicit ELSE nor a JOIN was needed to trigger it - a bare SELECT-list
-# simple CASE was enough. `execute()`'s own tests didn't hit this because
+# simple CASE was enough. `execute()`'s own tests never hit this because
 # `execute()` calls full `optimize()` first, rewriting the simple CASE away
 # before this ever mattered - this test uses the qualify/annotate_types/
 # Plan/PythonExecutor pipeline directly, mirroring coverage.py, to exercise
@@ -656,9 +658,8 @@ def test_date_datetime_comparison_does_not_coerce(sql, schema, rows, expected):
 # Found stress-testing sqlcov against a real Athena CTAS: a JOIN condition
 # matching `ipd2.ipdt_product = CASE seed.product WHEN 'svr' THEN 'stvr'
 # WHEN 'bvr' THEN 'btb' END` - a bare SELECT-list simple CASE reproduces the
-# identical failure with no JOIN needed at all. Fixed upstream (the
-# PythonGenerator's `_case_sql` now emits `==` for the subject comparison);
-# kept as a regression guard.
+# identical failure with no JOIN needed at all. Fixed upstream; kept as a
+# regression guard.
 
 
 def test_simple_case_with_subject():
@@ -688,20 +689,16 @@ def test_simple_case_with_subject():
 # --- Fixed: CROSS JOIN UNNEST of a column reference (not a literal array) ---
 # The already-fixed test_unnest_in_from_clause above covers `UNNEST(ARRAY[1,
 # 2, 3])` - a literal array needing no row context to evaluate.
-# `PythonExecutor.scan_unnest` evaluated the UNNEST expression against a
-# brand-new, completely empty static context - fine for a literal, but a real
-# column reference like `UNNEST(t.arr)` needs the *joined* row's own context
-# to resolve `t`, which was never wired in: a bare `KeyError` naming the outer
-# table, not a wrong answer. The array to explode differs per outer row, so
-# it can't be scanned as an independent Step the way a real table can -
-# planner.Join.from_joins now stashes the raw Unnest node on the join info
-# instead of adding a Scan dependency for it, and PythonExecutor.join
-# evaluates it directly against each row of the join accumulated so far
-# (`lateral_unnest_join`), the way a LATERAL join would.
+# `PythonExecutor.scan_unnest` used to evaluate the UNNEST expression against
+# a brand-new, completely empty static context - fine for a literal, but a
+# real column reference like `UNNEST(t.arr)` needs the *joined* row's own
+# context to resolve `t`, which was never wired in: a bare `KeyError` naming
+# the outer table, not a wrong answer.
 #
 # Found stress-testing sqlcov against a real Athena CTAS: `FROM _opened_loans
 # CROSS JOIN UNNEST(_opened_loans.customer_set_latest) AS u(cust_id)` -
 # exploding an array-typed column from the joined CTE itself, not a literal.
+# Fixed upstream; kept as a regression guard.
 
 
 def test_unnest_of_column_reference():
@@ -711,3 +708,39 @@ def test_unnest_of_column_reference():
         dialect="presto",
     )
     assert sorted(res.rows) == [(1, 10), (1, 20), (2, 30)]
+
+
+# --- Fixed: WITH RECURSIVE is now supported ----------------------------------
+# planner.py/PythonExecutor previously had no concept of a self-referential
+# CTE at all - the whole design was a single-pass DAG of Steps, each
+# depending only on already-built ones, fundamentally incompatible with a
+# recursive term that reads from the very CTE it's still defining. Fixed by
+# adding a dedicated `RecursiveCTE` Step whose anchor/recursive-term subtrees
+# are run iteratively (anchor once, then the recursive term repeatedly
+# against the previous round's new rows, via a `RecursiveRef` placeholder)
+# rather than once each through the executor's generic flat-DAG dispatch.
+#
+# Found stress-testing sqlcov against a real Athena CTAS: a `WITH RECURSIVE
+# walk(...)` chain walking a linked list of account-merge edges to its root.
+
+
+def test_recursive_cte():
+    res = execute(
+        """
+        WITH RECURSIVE walk(current_id, next_id) AS (
+          SELECT base.current_id, base.next_id FROM base
+          UNION ALL
+          SELECT curr.next_id, nxt.next_id
+          FROM walk AS curr
+          INNER JOIN base AS nxt ON curr.next_id = nxt.current_id
+        )
+        SELECT * FROM walk
+        """,
+        tables={"base": [{"current_id": 1, "next_id": 2}, {"current_id": 2, "next_id": 3}]},
+        dialect="presto",
+    )
+    # base rows (1, 2) and (2, 3), plus one recursive round: from (1, 2),
+    # next_id=2 joins base.current_id=2 -> adds (2, 3) again (UNION ALL, not
+    # DISTINCT); from (2, 3), next_id=3 has no match in base, so recursion
+    # stops there.
+    assert sorted(res.rows) == [(1, 2), (2, 3), (2, 3)]

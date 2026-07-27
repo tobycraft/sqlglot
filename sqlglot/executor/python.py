@@ -12,56 +12,112 @@ from sqlglot.generators.python import PythonGenerator
 
 
 class PythonExecutor:
-    def __init__(self, env=None, tables=None):
+    def __init__(self, env=None, tables=None, recursion_limit=10_000):
         self.generator = Python().generator(identify=True, comments=False)
         self.env = {**ENV, **(env or {})}
         self.tables = tables or {}
+        self.recursion_limit = recursion_limit
 
     def execute(self, plan):
-        finished = set()
-        queue = set(plan.leaves)
-        contexts = {}
+        return self._run(plan.root).tables[plan.root.name]
+
+    def _run(self, root, seed=None):
+        """
+        Runs the Step DAG rooted at `root` to completion and returns its Context.
+
+        `seed` pre-populates `contexts` for specific Step objects (e.g. a
+        RecursiveCTE's own working-table placeholder, or an outer CTE it
+        depends on) - those nodes are treated as already finished and are
+        never dispatched generically, which lets `recursive_cte` re-run the
+        same `body` subtree against a different table on each iteration.
+        """
+        dag = {}
+        nodes = {root}
+
+        while nodes:
+            node = nodes.pop()
+            dag[node] = set(node.dependencies)
+            nodes.update(node.dependencies)
+
+        contexts = dict(seed or {})
+        finished = set(contexts)
+        queue = {
+            node
+            for node, deps in dag.items()
+            if node not in finished and all(d in contexts for d in deps)
+        }
 
         while queue:
             node = queue.pop()
             try:
-                context = self.context(
-                    {
-                        name: table
-                        for dep in node.dependencies
-                        for name, table in contexts[dep].tables.items()
-                    }
-                )
-
-                if isinstance(node, planner.Scan):
-                    contexts[node] = self.scan(node, context)
-                elif isinstance(node, planner.Window):
-                    contexts[node] = self.window(node, context)
-                elif isinstance(node, planner.Aggregate):
-                    contexts[node] = self.aggregate(node, context)
-                elif isinstance(node, planner.Join):
-                    contexts[node] = self.join(node, context)
-                elif isinstance(node, planner.Sort):
-                    contexts[node] = self.sort(node, context)
-                elif isinstance(node, planner.SetOperation):
-                    contexts[node] = self.set_operation(node, context)
+                if node in contexts:
+                    pass
                 else:
-                    raise NotImplementedError
+                    context = self.context(
+                        {
+                            name: table
+                            for dep in node.dependencies
+                            for name, table in contexts[dep].tables.items()
+                        }
+                    )
+
+                    if isinstance(node, planner.Scan):
+                        contexts[node] = self.scan(node, context)
+                    elif isinstance(node, planner.Window):
+                        contexts[node] = self.window(node, context)
+                    elif isinstance(node, planner.Aggregate):
+                        contexts[node] = self.aggregate(node, context)
+                    elif isinstance(node, planner.Join):
+                        contexts[node] = self.join(node, context)
+                    elif isinstance(node, planner.Sort):
+                        contexts[node] = self.sort(node, context)
+                    elif isinstance(node, planner.SetOperation):
+                        contexts[node] = self.set_operation(node, context)
+                    elif isinstance(node, planner.RecursiveCTE):
+                        contexts[node] = self.recursive_cte(
+                            node, {dep: contexts[dep] for dep in node.dependencies}
+                        )
+                    else:
+                        raise NotImplementedError
 
                 finished.add(node)
 
                 for dep in node.dependents:
-                    if all(d in contexts for d in dep.dependencies):
+                    if dep in dag and all(d in contexts for d in dep.dependencies):
                         queue.add(dep)
 
                 for dep in node.dependencies:
-                    if all(d in finished for d in dep.dependents):
+                    if dep not in (seed or {}) and all(d in finished for d in dep.dependents):
                         contexts.pop(dep)
             except Exception as e:
                 raise ExecuteError(f"Step '{node.id}' failed: {e}") from e
 
-        root = plan.root
-        return contexts[root].tables[root.name]
+        return contexts[root]
+
+    def recursive_cte(self, step, foreign_seed):
+        accumulated = self._run(step.anchor, seed=foreign_seed).tables[step.anchor.name]
+        working = accumulated
+
+        for _ in range(self.recursion_limit):
+            seed = {**foreign_seed, step.ref: self.context({step.name: working})}
+            new_rows = self._run(step.body, seed=seed).tables[step.body.name]
+
+            rows = new_rows.rows
+            if step.distinct:
+                seen = set(accumulated.rows)
+                rows = [row for row in rows if row not in seen]
+
+            if not rows:
+                break
+
+            accumulated.rows.extend(rows)
+            working = Table(new_rows.columns, rows)
+        else:
+            raise ExecuteError(
+                f"Recursive CTE '{step.name}' exceeded {self.recursion_limit} iterations"
+            )
+
+        return self.context({step.name: accumulated})
 
     def generate(self, expression):
         """Convert a SQL expression into literal Python code and compile it into bytecode."""

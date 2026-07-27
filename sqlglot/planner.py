@@ -128,6 +128,20 @@ class Step:
         if with_ is not None:
             ctes = ctes.copy()
             for cte in with_.expressions:
+                is_recursive = (
+                    with_.args.get("recursive")
+                    and isinstance(cte.this, exp.Union)
+                    and any(
+                        table.name == cte.alias
+                        for table in cte.this.expression.find_all(exp.Table)
+                    )
+                )
+
+                if is_recursive:
+                    recursive_step = RecursiveCTE.from_cte(cte, ctes)
+                    ctes[recursive_step.name] = recursive_step  # type: ignore
+                    continue
+
                 step = Step.from_expression(cte.this, ctes)
                 old_name = step.name
                 step.name = cte.alias
@@ -579,3 +593,70 @@ class SetOperation(Step):
     @property
     def type_name(self) -> str:
         return self.op.__name__
+
+
+class RecursiveRef(Step):
+    """
+    Zero-dependency leaf standing in for a RecursiveCTE's own name while its
+    recursive term is being built - `PythonExecutor` never computes this
+    generically; it's always supplied a table via a seed context for the
+    current iteration's working table.
+    """
+
+
+class RecursiveCTE(Step):
+    """
+    A self-referential `WITH RECURSIVE name AS (anchor UNION [ALL] recursive_term)`.
+
+    `anchor` and `body` are deliberately not wired in via `add_dependency` -
+    unlike every other Step, they're private subtrees that must be run
+    iteratively (anchor once, body repeatedly against the previous round's new
+    rows) rather than once each via the generic flat-DAG dispatch. Only
+    `dependencies` added via `add_dependency` (other, non-recursive CTEs this
+    one's anchor/body may reference) participate in the outer Plan.dag.
+    """
+
+    @classmethod
+    def from_cte(cls, cte: exp.CTE, ctes: dict[str, Step]) -> RecursiveCTE:
+        union = cte.this
+        assert isinstance(union, exp.Union)
+
+        # Snapshotted before this CTE's own entry is added to `ctes`, so a
+        # foreign reference to an earlier CTE can't turn into a self-cycle.
+        foreign_ctes = dict(ctes)
+
+        ref = RecursiveRef()
+        ref.name = cte.alias
+
+        anchor_step = Step.from_expression(union.this, ctes)
+        body_step = Step.from_expression(union.expression, {**ctes, cte.alias: ref})
+
+        step = cls()
+        step.name = cte.alias
+        step.anchor = anchor_step
+        step.body = body_step
+        step.ref = ref
+        step.distinct = bool(union.args.get("distinct"))
+
+        for foreign_step in foreign_ctes.values():
+            step.add_dependency(foreign_step)
+
+        return step
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor: Step
+        self.body: Step
+        self.ref: RecursiveRef
+        self.distinct: bool = False
+
+    def _to_s(self, indent: str) -> list[str]:
+        def _reindented(step: Step) -> str:
+            return "\n".join(f"{indent}{line}" for line in step.to_s().splitlines())
+
+        lines = [f"{indent}Distinct: {self.distinct}"] if self.distinct else []
+        lines.append(f"{indent}Anchor:")
+        lines.append(_reindented(self.anchor))
+        lines.append(f"{indent}Recursive:")
+        lines.append(_reindented(self.body))
+        return lines
