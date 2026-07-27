@@ -327,10 +327,11 @@ class PythonExecutor:
                 values.append(partition_values[src] if 0 <= src < width else default)
             return values
 
-        if isinstance(func, exp.FirstValue):
+        if isinstance(func, (exp.FirstValue, exp.LastValue)):
             this = self.generate(func.this)
             if indices:
-                context.set_index(indices[0])
+                index = indices[0] if isinstance(func, exp.FirstValue) else indices[-1]
+                context.set_index(index)
                 value = context.eval(this)
             else:
                 value = None

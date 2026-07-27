@@ -8,9 +8,10 @@ Still-open gaps here are marked ``xfail(strict=True)``, asserting the
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
 the newly-supported construct). Most gaps found during that survey have
-already been fixed in the local sqlglot checkout (tracked via
-``[tool.uv.sources]`` in pyproject.toml while it's under active development)
-and are kept below as plain regression guards.
+been fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]``
+in pyproject.toml while it's under active development) and are kept below as
+plain regression guards; one is still open - a nested derived table used as
+one side of a JOIN - pending a fix upstream.
 """
 
 from __future__ import annotations
@@ -289,7 +290,7 @@ def test_previously_missing_function(expr, row, expected):
 # Found stress-testing sqlcov against a real Athena CTAS pipeline: a dedup CTE
 # that carries the first-seen value forward via
 # `FIRST_VALUE(x) OVER (PARTITION BY ... ORDER BY ...)`. Every window function
-# in _WINDOW_CASES above worked; FIRST_VALUE specifically raised
+# in _WINDOW_CASES above works; FIRST_VALUE specifically raised
 # `Window function not supported: FIRST_VALUE(...)` - PythonExecutor's window
 # dispatch had no case for it. Fixed upstream; kept as a regression guard.
 
@@ -301,6 +302,25 @@ def test_first_value_window_function():
         dialect="presto",
     )
     assert sorted(res.rows) == [(1, 10), (1, 10), (2, 5)]
+
+
+# --- Fixed: LAST_VALUE window function was not implemented ------------------
+# Same dispatch gap as FIRST_VALUE above: PythonExecutor's window dispatch had
+# no case for exp.LastValue, so `LAST_VALUE(x) OVER (...)` raised
+# `Window function not supported: LAST_VALUE(...)`. Like FIRST_VALUE, frame
+# bounds (ROWS/RANGE) are ignored, so this returns the last row of the whole
+# partition (by ORDER BY) rather than honoring the standard default frame
+# (UNBOUNDED PRECEDING TO CURRENT ROW). Fixed upstream; kept as a regression
+# guard.
+
+
+def test_last_value_window_function():
+    res = execute(
+        "SELECT a, LAST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS lv FROM t",
+        tables={"t": [{"a": 1, "b": 10}, {"a": 1, "b": 20}, {"a": 2, "b": 5}]},
+        dialect="presto",
+    )
+    assert sorted(res.rows) == [(1, 20), (1, 20), (2, 5)]
 
 
 # --- Fixed: `||` string concatenation has no Python codegen -----------------
@@ -323,13 +343,11 @@ def test_string_concat_operator():
 # --- Fixed: date + INTERVAL 'n' MONTH arithmetic ----------------------------
 # Found stress-testing sqlcov against a real Athena CTAS computing a
 # schedule's end date as `start_date + INTERVAL '1' MONTH + INTERVAL '-1' DAY`.
-# A DAY interval worked fine (it's a fixed duration), but a MONTH interval
-# used to compile to `datetime.timedelta(months=...)` - and `timedelta` has no
+# A DAY interval works fine (it's a fixed duration), but a MONTH interval used
+# to compile to `datetime.timedelta(months=...)` - and `timedelta` has no
 # `months` parameter (months aren't a fixed number of days), raising
 # `TypeError: 'months' is an invalid keyword argument for __new__()`. Fixed
-# upstream by having MONTH/QUARTER/YEAR intervals produce a `_MonthsDelta`
-# that shifts the calendar instead of a `timedelta`; kept as a regression
-# guard.
+# upstream; kept as a regression guard.
 
 
 def test_date_plus_interval_month():
@@ -342,7 +360,7 @@ def test_date_plus_interval_month():
     assert list(res.rows) == [(datetime.date(2024, 2, 15),)]
 
 
-# --- Fixed: an un-merged nested derived table broke the planner ------------
+# --- Fixed: an un-merged nested derived table broke the planner -------------
 # sqlcov deliberately runs only `qualify()` + `annotate_types()` before
 # planning (not the full `optimize()` pipeline `execute()` uses under the
 # hood) - see coverage.py's module docstring - specifically so a predicate
@@ -351,24 +369,16 @@ def test_date_plus_interval_month():
 # `SELECT * FROM (SELECT a FROM t)` into one Scan; skip that rule (as sqlcov's
 # pipeline does) and the *same* SQL, planned and executed the exact way
 # sqlcov does it, used to die with a KeyError naming the wrapper's
-# auto-generated alias (e.g. "_0"). `planner.Scan.from_expression` collapses
-# a pass-through derived table by reusing its innermost Step and simply
-# renaming it to the derived table's own alias - when that innermost Step is
-# itself a physical-table Scan, the rename leaves `step.source` (the real
-# table expression) referring to the *original* table alias while
-# `step.projections`/`step.condition` end up qualified with the *new*, outer
-# alias instead. `PythonExecutor.scan_table` then registered the scanned
-# table only under the original physical alias, so evaluating projections
-# qualified with the outer alias raised a bare KeyError. Fixed by also
-# registering the table under `step.name` whenever it differs from the
-# physical alias. Found stress-testing sqlcov against a real Athena CTAS
-# whose CTEs nest several unaliased derived tables
-# (`SELECT * FROM (SELECT * FROM (...))`), which Athena's own DDL exporter
-# routinely emits and qualify() names `_innerN`. `execute()`'s own tests all
-# passed regardless because `execute()` calls full `optimize()` first, which
-# erases the wrapper before this ever mattered - this test uses the
-# qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
-# coverage.py, to exercise the code path sqlcov actually runs.
+# auto-generated alias (e.g. "_0") - the Scan step for the outer SELECT looked
+# the inner derived table up in a tables map that was never populated for it.
+# Found stress-testing sqlcov against a real Athena CTAS whose CTEs nest
+# several unaliased derived tables (`SELECT * FROM (SELECT * FROM (...))`),
+# which Athena's own DDL exporter routinely emits and qualify() names
+# `_innerN`. `execute()`'s own tests all passed throughout because `execute()`
+# calls full `optimize()` first, which erases the wrapper before this ever
+# mattered - this test uses the qualify/annotate_types/Plan/PythonExecutor
+# pipeline directly, mirroring coverage.py, to exercise the code path sqlcov
+# actually runs. Fixed upstream; kept as a regression guard.
 
 
 def test_nested_derived_table_without_subquery_merging():
