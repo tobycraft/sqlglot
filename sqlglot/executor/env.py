@@ -165,6 +165,60 @@ def interval(this, unit):
     return datetime.timedelta(**{unit.lower(): float(this)})
 
 
+def _as_datetime(value):
+    if isinstance(value, datetime.datetime):
+        return value
+    return datetime.datetime(value.year, value.month, value.day)
+
+
+def _month_diff(start, end):
+    start_dt = _as_datetime(start)
+    end_dt = _as_datetime(end)
+    months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
+
+    if (end_dt.day, end_dt.hour, end_dt.minute, end_dt.second, end_dt.microsecond) < (
+        start_dt.day,
+        start_dt.hour,
+        start_dt.minute,
+        start_dt.second,
+        start_dt.microsecond,
+    ):
+        months -= 1
+
+    return months
+
+
+_DATEDIFF_UNIT_SECONDS = {
+    "week": 604800,
+    "day": 86400,
+    "hour": 3600,
+    "minute": 60,
+    "second": 1,
+    "millisecond": 0.001,
+    "microsecond": 0.000001,
+}
+
+
+@null_if_any("this", "expression")
+def datediff(this, expression, unit="day"):
+    unit = unit.lower()
+
+    if unit in ("year", "quarter", "month"):
+        months = _month_diff(expression, this)
+        if unit == "year":
+            return int(months / 12)
+        if unit == "quarter":
+            return int(months / 3)
+        return months
+
+    unit_seconds = _DATEDIFF_UNIT_SECONDS.get(unit)
+    if unit_seconds is None:
+        raise NotImplementedError(f"DATEDIFF does not support unit '{unit}'.")
+
+    seconds = (_as_datetime(this) - _as_datetime(expression)).total_seconds()
+    return int(seconds / unit_seconds)
+
+
 @null_if_any("this", "expression")
 def arraytostring(this, expression, null=None):
     return expression.join(x for x in (x if x is not None else null for x in this) if x is not None)
@@ -212,7 +266,7 @@ ENV = {
     "CONCAT": null_if_any(lambda *args: "".join(args)),
     "SAFECONCAT": null_if_any(lambda *args: "".join(str(arg) for arg in args)),
     "CONCATWS": null_if_any(lambda this, *args: this.join(args)),
-    "DATEDIFF": null_if_any(lambda this, expression, *_: (this - expression).days),
+    "DATEDIFF": datediff,
     "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
     "DIV": null_if_any(lambda e, this: e / this),
     "DOT": null_if_any(lambda e, this: e[this]),

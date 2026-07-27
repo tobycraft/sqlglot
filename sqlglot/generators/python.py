@@ -64,6 +64,13 @@ def _cast_sql(self, e: exp.Cast) -> str:
     return f"CAST({self.sql(e.this)}, exp.DType.{to.this.value}{params})"
 
 
+def _date_diff_sql(self, e: exp.DateDiff) -> str:
+    this = self.sql(e, "this")
+    expression = self.sql(e, "expression")
+    unit = (e.text("unit") or "day").lower()
+    return f"DATEDIFF({this}, {expression}, {unit!r})"
+
+
 def _div_sql(self: generator.Generator, e: exp.Div) -> str:
     denominator = self.sql(e, "expression")
 
@@ -93,6 +100,7 @@ class PythonGenerator(generator.Generator):
         exp.Concat: lambda self, e: self.func(
             "SAFECONCAT" if e.args.get("safe") else "CONCAT", *e.expressions
         ),
+        exp.DateDiff: _date_diff_sql,
         exp.Distinct: lambda self, e: f"set({self.sql(e, 'this')})",
         exp.Div: _div_sql,
         exp.Extract: lambda self, e: f"EXTRACT('{e.name.lower()}', {self.sql(e, 'expression')})",

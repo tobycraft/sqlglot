@@ -118,9 +118,6 @@ def test_cast_to_bare_decimal_preserves_fraction():
 # will silently evaluate against the wrong number.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="DATE_DIFF ignores its unit argument and always returns a day count"
-)
 def test_date_diff_honors_unit():
     res = execute(
         "SELECT DATE_DIFF('month', CAST(d1 AS DATE), CAST(d2 AS DATE)) AS x FROM t",
