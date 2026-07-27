@@ -3,7 +3,7 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here are marked ``xfail(strict=True)``, asserting the
+Still-open gaps, if any, are marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
@@ -20,17 +20,15 @@ import datetime
 import pytest
 from sqlglot.executor import execute
 
-# --- Bare DATE(...) constructor under the athena dialect --------------------
+# --- Fixed: bare DATE(...) constructor under the athena dialect -------------
 # Under "athena", DATE(x) parses to its own exp.Date node (rather than
 # normalizing to CAST(x AS DATE), the way it does under "presto"), and
-# sqlglot.executor.env.ENV has no "DATE" entry - so it raises NameError the
-# moment a row is evaluated. Found stress-testing sqlcov against a real
-# Athena CTAS: `DATE(('2025-11-30'))` in a CASE guard.
+# sqlglot.executor.env.ENV had no "DATE" entry - so it raised NameError the
+# moment a row was evaluated. Found stress-testing sqlcov against a real
+# Athena CTAS: `DATE(('2025-11-30'))` in a CASE guard. Fixed upstream; kept as
+# a regression guard.
 
 
-@pytest.mark.xfail(
-    strict=True, reason="exp.Date (bare DATE(...) under athena) is not in ENV: NameError"
-)
 def test_date_constructor_under_athena_dialect():
     res = execute(
         "SELECT DATE(('2025-11-30')) AS x FROM t", tables={"t": [{"a": 1}]}, dialect="athena"

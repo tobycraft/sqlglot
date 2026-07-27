@@ -170,6 +170,18 @@ def try_cast(this, to, *params):
         return None
 
 
+def date_(this=None):
+    if this is None:
+        return datetime.date.today()
+    if isinstance(this, datetime.datetime):
+        return this.date()
+    if isinstance(this, datetime.date):
+        return this
+    if isinstance(this, str):
+        return datetime.date.fromisoformat(this)
+    raise NotImplementedError(f"DATE does not support argument '{this}'.")
+
+
 def ordered(this, desc, nulls_first):
     if desc:
         return reverse_key(this)
@@ -359,6 +371,7 @@ ENV = {
     "CONCAT": null_if_any(lambda *args: "".join(args)),
     "SAFECONCAT": null_if_any(lambda *args: "".join(str(arg) for arg in args)),
     "CONCATWS": null_if_any(lambda this, *args: this.join(args)),
+    "DATE": date_,
     "DATEADD": dateadd,
     "DATEDIFF": datediff,
     "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
