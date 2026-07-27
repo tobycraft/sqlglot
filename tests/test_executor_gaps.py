@@ -20,15 +20,57 @@ import datetime
 import pytest
 from sqlglot.executor import execute
 
+# --- Fixed: an expression wrapping a window function, in the SAME select ----
+# When a window function's result was consumed by another expression *within
+# the same SELECT that computes it* (comparison, arithmetic, CASE, even a
+# plain scalar function call), the planner matched on `e.find(exp.Window)` and
+# replaced the *entire* projection with a bare reference to the window's
+# value, silently discarding the wrapping expression - no error, just a wrong
+# number. This is distinct from test_date_trunc_over_window_aggregate below,
+# which wraps a window result that was already materialized as a plain column
+# by an *earlier* CTE/step - that case worked fine; only same-select wrapping
+# was affected. Found this way stress-testing sqlcov: a CASE guarding on
+# `SUM(x) OVER (PARTITION BY ...)` in the same CTE that computes the sum
+# silently returned the sum itself (always truthy), miscounting every arm.
+# Fixed upstream by rewriting each window reference in place to a column
+# pointing at its computed value, and keeping the wrapping expression as the
+# projection; kept as a regression guard.
+
+_WINDOW_WRAPPED_CASES = [
+    pytest.param(
+        "SUM(b) OVER (PARTITION BY a) + 1",
+        [(1, 16), (1, 16), (2, 6), (2, 6)],
+        id="arithmetic",
+    ),
+    pytest.param(
+        "SUM(b) OVER (PARTITION BY a) > 10",
+        [(1, True), (1, True), (2, False), (2, False)],
+        id="comparison",
+    ),
+    pytest.param(
+        "CASE WHEN SUM(b) OVER (PARTITION BY a) > 10 THEN 'big' ELSE 'small' END",
+        [(1, "big"), (1, "big"), (2, "small"), (2, "small")],
+        id="case",
+    ),
+]
+
+
+@pytest.mark.parametrize("expr, expected", _WINDOW_WRAPPED_CASES)
+def test_expression_wrapping_window_in_same_select(expr, expected):
+    tables = {"t": [{"a": 1, "b": 6}, {"a": 1, "b": 9}, {"a": 2, "b": 3}, {"a": 2, "b": 2}]}
+    schema = {"t": {"a": "BIGINT", "b": "BIGINT"}}
+    res = execute(f"SELECT a, {expr} AS x FROM t", schema=schema, tables=tables, dialect="presto")
+    assert sorted(res.rows) == sorted(expected)
+
+
 # --- Fixed: DATE_TRUNC on a window-aggregate result -------------------------
 # DATE_TRUNC(unit, MIN(d) OVER (...)) - i.e. applied to a window aggregate's
-# result rather than a plain column - gets canonicalized to exp.TimestampTrunc
-# instead of exp.DateTrunc, since the builder only recognizes a direct
-# `CAST(... AS DATE)` as a date-typed argument. sqlglot.executor.env.ENV had
-# "DATETRUNC" (fixed previously) but no "TIMESTAMPTRUNC", so it raised
-# NameError. Found stress-testing sqlcov against a real Athena CTAS:
-# `DATE_TRUNC('month', MIN(...) OVER (...))`. Fixed upstream; kept as a
-# regression guard.
+# result rather than a plain column - used to get canonicalized to
+# exp.TimestampTrunc instead of exp.DateTrunc, even when the underlying
+# column is schema-typed DATE, and sqlglot.executor.env.ENV had no
+# "TIMESTAMPTRUNC" entry (only "DATETRUNC"). Found stress-testing sqlcov
+# against a real Athena CTAS: `DATE_TRUNC('month', MIN(...) OVER (...))`.
+# Fixed upstream; kept as a regression guard.
 
 
 def test_date_trunc_over_window_aggregate():

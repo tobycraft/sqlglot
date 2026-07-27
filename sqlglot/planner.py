@@ -171,11 +171,25 @@ class Step:
             step.aggregations = list(aggregations)
 
         for e in expression.expressions:
-            window = e.find(exp.Window)
-            if window:
-                name = e.alias_or_name or next_window_name()
-                windows[name] = window
-                projections.append(exp.column(name, step.name, quoted=True))
+            windows_in_e = list(e.find_all(exp.Window))
+            if windows_in_e:
+                bare = e.this if isinstance(e, exp.Alias) else e
+                if bare in windows_in_e:
+                    # the projection is a (possibly aliased) window with nothing else
+                    # wrapping it, e.g. `SUM(b) OVER (...) AS s`
+                    name = e.alias_or_name or next_window_name()
+                    windows[name] = bare
+                    projections.append(exp.column(name, step.name, quoted=True))
+                else:
+                    # the window's result is consumed by an enclosing expression in the
+                    # same select, e.g. `SUM(b) OVER (...) + 1` or a CASE guarding on it;
+                    # compute the window(s) as usual but keep the wrapping expression,
+                    # rewriting each window reference into a column pointing at its value
+                    for window in windows_in_e:
+                        name = next_window_name()
+                        windows[name] = window
+                        window.replace(exp.column(name, step.name, quoted=True))
+                    projections.append(e)
             elif e.find(exp.AggFunc):
                 projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
                 extract_agg_operands(e)
