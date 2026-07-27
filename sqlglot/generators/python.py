@@ -64,11 +64,24 @@ def _cast_sql(self, e: exp.Cast) -> str:
     return f"CAST({self.sql(e.this)}, exp.DType.{to.this.value}{params})"
 
 
+def _try_cast_sql(self, e: exp.TryCast) -> str:
+    to = e.args["to"]
+    params = "".join(f", {self.sql(p)}" for p in to.expressions)
+    return f"TRYCAST({self.sql(e.this)}, exp.DType.{to.this.value}{params})"
+
+
 def _date_diff_sql(self, e: exp.DateDiff) -> str:
     this = self.sql(e, "this")
     expression = self.sql(e, "expression")
     unit = (e.text("unit") or "day").lower()
     return f"DATEDIFF({this}, {expression}, {unit!r})"
+
+
+def _date_add_sql(self, e: exp.DateAdd) -> str:
+    this = self.sql(e, "this")
+    expression = self.sql(e, "expression")
+    unit = (e.text("unit") or "day").lower()
+    return f"DATEADD({this}, {expression}, {unit!r})"
 
 
 def _div_sql(self: generator.Generator, e: exp.Div) -> str:
@@ -96,10 +109,12 @@ class PythonGenerator(generator.Generator):
         exp.Between: _rename,
         exp.Boolean: lambda self, e: "True" if e.this else "False",
         exp.Cast: _cast_sql,
+        exp.TryCast: _try_cast_sql,
         exp.Column: lambda self, e: f"scope[{self.sql(e, 'table') or None}][{self.sql(e.this)}]",
         exp.Concat: lambda self, e: self.func(
             "SAFECONCAT" if e.args.get("safe") else "CONCAT", *e.expressions
         ),
+        exp.DateAdd: _date_add_sql,
         exp.DateDiff: _date_diff_sql,
         exp.Distinct: lambda self, e: f"set({self.sql(e, 'this')})",
         exp.Div: _div_sql,

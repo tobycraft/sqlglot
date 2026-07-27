@@ -1,5 +1,7 @@
+import calendar
 import datetime
 import inspect
+import math
 import re
 import statistics
 from functools import wraps
@@ -97,6 +99,15 @@ def substring(this, start=None, length=None):
     return this[start:end]
 
 
+@null_if_any("this", "delimiter", "part")
+def split_part(this, delimiter, part):
+    parts = this.split(delimiter)
+    index = part - 1 if part > 0 else part
+    if -len(parts) <= index < len(parts):
+        return parts[index]
+    return ""
+
+
 DECIMAL_TYPES = {
     exp.DType.DECIMAL,
     exp.DType.DECIMAL32,
@@ -149,6 +160,14 @@ def cast(this, to, *params):
     if to in exp.DataType.NUMERIC_TYPES:
         return int(this)
     raise NotImplementedError(f"Casting {this} to '{to}' not implemented.")
+
+
+@null_if_any("this", "to")
+def try_cast(this, to, *params):
+    try:
+        return cast(this, to, *params)
+    except (NotImplementedError, TypeError, ValueError):
+        return None
 
 
 def ordered(this, desc, nulls_first):
@@ -219,6 +238,74 @@ def datediff(this, expression, unit="day"):
     return int(seconds / unit_seconds)
 
 
+def _as_date(this, result):
+    if isinstance(this, datetime.date) and not isinstance(this, datetime.datetime):
+        return result.date()
+    return result
+
+
+def _add_months(dt, months):
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+@null_if_any("unit", "this")
+def datetrunc(unit, this):
+    unit = unit.lower()
+    dt = _as_datetime(this)
+
+    if unit == "year":
+        result = dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif unit == "quarter":
+        quarter_month = ((dt.month - 1) // 3) * 3 + 1
+        result = dt.replace(month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif unit == "month":
+        result = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif unit == "week":
+        result = (dt - datetime.timedelta(days=dt.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    elif unit == "day":
+        result = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif unit == "hour":
+        result = dt.replace(minute=0, second=0, microsecond=0)
+    elif unit == "minute":
+        result = dt.replace(second=0, microsecond=0)
+    elif unit == "second":
+        result = dt.replace(microsecond=0)
+    else:
+        raise NotImplementedError(f"DATE_TRUNC does not support unit '{unit}'.")
+
+    return _as_date(this, result)
+
+
+@null_if_any("this", "expression")
+def dateadd(this, expression, unit="day"):
+    unit = unit.lower()
+    dt = _as_datetime(this)
+
+    if unit in ("year", "quarter", "month"):
+        months = expression * (12 if unit == "year" else 3 if unit == "quarter" else 1)
+        result = _add_months(dt, months)
+    else:
+        unit_seconds = _DATEDIFF_UNIT_SECONDS.get(unit)
+        if unit_seconds is None:
+            raise NotImplementedError(f"DATE_ADD does not support unit '{unit}'.")
+        result = dt + datetime.timedelta(seconds=unit_seconds * expression)
+
+    return _as_date(this, result)
+
+
+@null_if_any("this")
+def lastday(this, unit=None):
+    dt = _as_datetime(this)
+    last_day = calendar.monthrange(dt.year, dt.month)[1]
+    return _as_date(this, dt.replace(day=last_day))
+
+
 @null_if_any("this", "expression")
 def arraytostring(this, expression, null=None):
     return expression.join(x for x in (x if x is not None else null for x in this) if x is not None)
@@ -254,6 +341,12 @@ ENV = {
     "ABS": null_if_any(lambda this: abs(this)),
     "ADD": null_if_any(lambda e, this: e + this),
     "ARRAYANY": null_if_any(lambda arr, func: any(func(e) for e in arr)),
+    "ARRAYCONTAINS": null_if_any(lambda arr, e: e in arr),
+    "ARRAYDISTINCT": null_if_any(lambda arr: list(dict.fromkeys(arr))),
+    "ARRAYMIN": null_if_any(min),
+    "ARRAYSIZE": null_if_any(lambda arr, *_: len(arr)),
+    "ARRAYSORT": null_if_any(lambda arr, *_: sorted(arr)),
+    "ARRAYS_OVERLAP": null_if_any(lambda a, b: bool(set(a) & set(b))),
     "ARRAYTOSTRING": arraytostring,
     "BETWEEN": null_if_any(lambda this, low, high: low <= this and this <= high),
     "BITWISEAND": null_if_any(lambda this, e: this & e),
@@ -266,18 +359,27 @@ ENV = {
     "CONCAT": null_if_any(lambda *args: "".join(args)),
     "SAFECONCAT": null_if_any(lambda *args: "".join(str(arg) for arg in args)),
     "CONCATWS": null_if_any(lambda this, *args: this.join(args)),
+    "DATEADD": dateadd,
     "DATEDIFF": datediff,
     "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
+    "DATETRUNC": datetrunc,
+    "DAYOFWEEKISO": null_if_any(lambda arg: arg.isoweekday()),
     "DIV": null_if_any(lambda e, this: e / this),
     "DOT": null_if_any(lambda e, this: e[this]),
+    "ENCODE": null_if_any(lambda this, charset="utf-8": this.encode(charset)),
     "EQ": null_if_any(lambda this, e: this == e),
     "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),
+    "FLATTEN": null_if_any(lambda arr: [x for sub in arr for x in sub]),
+    "GREATEST": null_if_any(lambda *args: max(args)),
     "GT": null_if_any(lambda this, e: this > e),
     "GTE": null_if_any(lambda this, e: this >= e),
     "IF": lambda predicate, true, false: true if predicate else false,
     "INTDIV": null_if_any(lambda e, this: e // this),
     "INTERVAL": interval,
+    "ISNAN": null_if_any(math.isnan),
     "JSONEXTRACT": jsonextract,
+    "LASTDAY": lastday,
+    "LEAST": null_if_any(lambda *args: min(args)),
     "LEFT": null_if_any(lambda this, e: this[:e]),
     "LIKE": null_if_any(
         lambda this, e: bool(re.match(e.replace("_", ".").replace("%", ".*"), this))
@@ -294,10 +396,13 @@ ENV = {
     "POW": pow,
     "RIGHT": null_if_any(lambda this, e: this[-e:]),
     "ROUND": null_if_any(lambda this, decimals=None, truncate=None: round(this, ndigits=decimals)),
+    "SIGN": null_if_any(lambda this: (this > 0) - (this < 0)),
+    "SPLITPART": split_part,
     "STRPOSITION": str_position,
     "SUB": null_if_any(lambda e, this: e - this),
     "SUBSTRING": substring,
     "TIMESTRTOTIME": null_if_any(lambda arg: datetime.datetime.fromisoformat(arg)),
+    "TRYCAST": try_cast,
     "UPPER": null_if_any(lambda arg: arg.upper()),
     "YEAR": null_if_any(lambda arg: arg.year),
     "MONTH": null_if_any(lambda arg: arg.month),

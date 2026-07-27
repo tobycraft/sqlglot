@@ -147,14 +147,14 @@ def test_unnest_in_from_clause():
     assert sorted(res.rows) == [(1,), (2,), (3,)]
 
 
-# --- Missing scalar/array functions: NameError at row-eval time ------------
-# Each of these compiles fine - the generator just emits a call to an
-# ALL_CAPS name - but sqlglot.executor.env.ENV has no entry for it, so
-# evaluating any row raises NameError. Grouped under one parametrized test
-# because they share a single root cause: ENV implements a small, hand-picked
-# subset of sqlglot's function surface, not the full dialect.
+# --- Missing scalar functions: fixed by registering them in ENV -----------
+# Fixed: sqlglot.executor.env.ENV now implements DATETRUNC, DATEADD,
+# DAYOFWEEKISO/LASTDAY, SIGN, ISNAN, ARRAYCONTAINS, ENCODE, SPLITPART,
+# TRYCAST, GREATEST and LEAST (plus PythonGenerator.TRANSFORMS entries for
+# exp.DateAdd and exp.TryCast, which previously emitted unquoted unit names
+# or fell through to the wrong TRANSFORMS entry).
 
-_MISSING_FUNCTION_CASES = [
+_FIXED_FUNCTION_CASES = [
     pytest.param(
         "DATE_TRUNC('month', CAST(d AS DATE))",
         {"d": "2024-03-15"},
@@ -179,12 +179,6 @@ _MISSING_FUNCTION_CASES = [
         5,
         id="day_of_week",
     ),
-    pytest.param("ARRAY_SORT(ARRAY[3, 1, 2])", {}, [1, 2, 3], id="array_sort"),
-    pytest.param("ARRAY_DISTINCT(ARRAY[1, 1, 2])", {}, [1, 2], id="array_distinct"),
-    pytest.param("ARRAYS_OVERLAP(ARRAY[1, 2], ARRAY[2, 3])", {}, True, id="arrays_overlap"),
-    pytest.param("ARRAY_MIN(ARRAY[3, 1, 2])", {}, 1, id="array_min"),
-    pytest.param("CARDINALITY(ARRAY[1, 2, 3])", {}, 3, id="cardinality"),
-    pytest.param("FLATTEN(ARRAY[ARRAY[1, 2], ARRAY[3]])", {}, [1, 2, 3], id="flatten"),
     pytest.param("SIGN(b)", {"b": -5}, -1, id="sign"),
     pytest.param("IS_NAN(CAST(b AS DOUBLE))", {"b": 5.0}, False, id="is_nan"),
     pytest.param("CONTAINS(ARRAY[1, 2], a)", {"a": 1}, True, id="contains"),
@@ -198,10 +192,37 @@ _MISSING_FUNCTION_CASES = [
 ]
 
 
+@pytest.mark.parametrize("expr, row, expected", _FIXED_FUNCTION_CASES)
+def test_missing_function(expr, row, expected):
+    res = execute(f"SELECT {expr} AS x FROM t", tables={"t": [row]}, dialect="presto")
+    assert list(res.rows) == [(expected,)]
+
+
+# --- Missing array functions: still blocked, but no longer by ENV ----------
+# ENV now has ARRAYSORT, ARRAYDISTINCT, ARRAYS_OVERLAP, ARRAYMIN, ARRAYSIZE
+# and FLATTEN, but these cases take no columns from `t`, so the row is `{}`.
+# `execute()` infers an empty schema for a zero-column table, whose
+# `supported_table_args` (`()`) then mismatches the literal table's
+# (`("this",)`), and `execute()` raises before the plan ever runs. That is a
+# planner/schema gap, not a missing-function one - distinct root cause, so
+# still xfails.
+
+_MISSING_FUNCTION_CASES = [
+    pytest.param("ARRAY_SORT(ARRAY[3, 1, 2])", {}, [1, 2, 3], id="array_sort"),
+    pytest.param("ARRAY_DISTINCT(ARRAY[1, 1, 2])", {}, [1, 2], id="array_distinct"),
+    pytest.param("ARRAYS_OVERLAP(ARRAY[1, 2], ARRAY[2, 3])", {}, True, id="arrays_overlap"),
+    pytest.param("ARRAY_MIN(ARRAY[3, 1, 2])", {}, 1, id="array_min"),
+    pytest.param("CARDINALITY(ARRAY[1, 2, 3])", {}, 3, id="cardinality"),
+    pytest.param("FLATTEN(ARRAY[ARRAY[1, 2], ARRAY[3]])", {}, [1, 2, 3], id="flatten"),
+]
+
+
 @pytest.mark.parametrize("expr, row, expected", _MISSING_FUNCTION_CASES)
 @pytest.mark.xfail(
-    strict=True, reason="function is not registered in sqlglot.executor.env.ENV: NameError"
+    strict=True,
+    reason="zero-column literal table's supported_table_args mismatches the inferred "
+    "empty schema's: ExecuteError before the function is ever called",
 )
-def test_missing_function(expr, row, expected):
+def test_missing_function_blocked_by_empty_table_schema(expr, row, expected):
     res = execute(f"SELECT {expr} AS x FROM t", tables={"t": [row]}, dialect="presto")
     assert list(res.rows) == [(expected,)]
