@@ -130,7 +130,13 @@ class PythonExecutor:
             return self.scan_unnest(step)
 
         table = self.tables.find(step.source)
-        context = self.context({step.source.alias_or_name: table})
+        tables = {step.source.alias_or_name: table}
+        if step.name and step.name != step.source.alias_or_name:
+            # an un-merged derived table reuses its innermost physical Scan step,
+            # renamed to the derived table's own alias, so its projections/condition
+            # may be qualified with either the physical table's alias or this one
+            tables[step.name] = table
+        context = self.context(tables)
         return context, iter(table)
 
     def scan_unnest(self, step):

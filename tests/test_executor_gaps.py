@@ -10,9 +10,7 @@ sqlcov's own coverage surface - predicates/CASE arms - should widen to use
 the newly-supported construct). Most gaps found during that survey have
 already been fixed in the local sqlglot checkout (tracked via
 ``[tool.uv.sources]`` in pyproject.toml while it's under active development)
-and are kept below as plain regression guards; two are still open -
-INTERVAL MONTH arithmetic and un-merged nested derived tables - pending a
-fix upstream.
+and are kept below as plain regression guards.
 """
 
 from __future__ import annotations
@@ -344,7 +342,7 @@ def test_date_plus_interval_month():
     assert list(res.rows) == [(datetime.date(2024, 2, 15),)]
 
 
-# --- Open: an un-merged nested derived table breaks the planner ------------
+# --- Fixed: an un-merged nested derived table broke the planner ------------
 # sqlcov deliberately runs only `qualify()` + `annotate_types()` before
 # planning (not the full `optimize()` pipeline `execute()` uses under the
 # hood) - see coverage.py's module docstring - specifically so a predicate
@@ -352,23 +350,27 @@ def test_date_plus_interval_month():
 # "merge subqueries" rule normally collapses a pass-through wrapper like
 # `SELECT * FROM (SELECT a FROM t)` into one Scan; skip that rule (as sqlcov's
 # pipeline does) and the *same* SQL, planned and executed the exact way
-# sqlcov does it, dies with a KeyError naming the wrapper's auto-generated
-# alias (e.g. "_0") - the Scan step for the outer SELECT looks the inner
-# derived table up in a tables map that was never populated for it. Found
-# stress-testing sqlcov against a real Athena CTAS whose CTEs nest several
-# unaliased derived tables (`SELECT * FROM (SELECT * FROM (...))`), which
-# Athena's own DDL exporter routinely emits and qualify() names `_innerN`.
-# `execute()`'s own tests all pass because `execute()` calls full `optimize()`
-# first, which erases the wrapper before this ever matters - this test uses
-# the qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
+# sqlcov does it, used to die with a KeyError naming the wrapper's
+# auto-generated alias (e.g. "_0"). `planner.Scan.from_expression` collapses
+# a pass-through derived table by reusing its innermost Step and simply
+# renaming it to the derived table's own alias - when that innermost Step is
+# itself a physical-table Scan, the rename leaves `step.source` (the real
+# table expression) referring to the *original* table alias while
+# `step.projections`/`step.condition` end up qualified with the *new*, outer
+# alias instead. `PythonExecutor.scan_table` then registered the scanned
+# table only under the original physical alias, so evaluating projections
+# qualified with the outer alias raised a bare KeyError. Fixed by also
+# registering the table under `step.name` whenever it differs from the
+# physical alias. Found stress-testing sqlcov against a real Athena CTAS
+# whose CTEs nest several unaliased derived tables
+# (`SELECT * FROM (SELECT * FROM (...))`), which Athena's own DDL exporter
+# routinely emits and qualify() names `_innerN`. `execute()`'s own tests all
+# passed regardless because `execute()` calls full `optimize()` first, which
+# erases the wrapper before this ever mattered - this test uses the
+# qualify/annotate_types/Plan/PythonExecutor pipeline directly, mirroring
 # coverage.py, to exercise the code path sqlcov actually runs.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="PythonExecutor: KeyError scanning an un-merged nested derived table "
-    "(only hit when optimize()'s merge-subqueries rule is skipped, as sqlcov does)",
-)
 def test_nested_derived_table_without_subquery_merging():
     schema = {"t": {"code": "BIGINT"}}
     tree = qualify(
