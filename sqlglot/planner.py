@@ -377,19 +377,29 @@ class Scan(Step):
 
         if isinstance(expression, exp.Subquery):
             table = expression.this
-            step = Step.from_expression(table, ctes)
-            old_name = step.name
-            step.name = alias_
+            inner = Step.from_expression(table, ctes)
 
-            if old_name and old_name != alias_:
-                # a pass-through derived table (`SELECT * FROM (...)`) reuses its
-                # inner Step wholesale, so if that inner Step was itself renamed
-                # to a now-stale alias (e.g. nesting another pass-through derived
-                # table one level deeper), its projections/condition are still
-                # qualified with that stale name; repoint them at the new one
-                _rename_table_qualifier(step.projections, old_name, alias_)
-                if step.condition:
-                    _rename_table_qualifier([step.condition], old_name, alias_)
+            # Wire the inner Step in as a genuine dependency - the same way a
+            # CTE reference is handled below (and in from_expression's `with_`
+            # handling above) - rather than renaming/reusing it in place. A
+            # derived table's own SELECT can compute or rename a column (e.g.
+            # `SELECT code AS x FROM t`), and its Step's projections are the
+            # only place that computation is ever performed; the previous
+            # approach here renamed the inner Step and returned it directly,
+            # so the caller's own projection-list build (`step.projections =
+            # projections` in from_expression) then overwrote those
+            # projections with the outer SELECT's - column references like
+            # `x` that assume the rename already happened, against a Step
+            # that never actually computes it. That raised a bare KeyError on
+            # the renamed column at execution time. Depending on the inner
+            # Step instead lets the executor's existing "scan a by-name
+            # dependency" path (see PythonExecutor.scan) evaluate the outer
+            # projections against the inner Step's real, already-computed
+            # output, exactly as it already does for a CTE reference.
+            step = Scan()
+            step.name = alias_
+            step.source = inner.name
+            step.add_dependency(inner)
 
             return step
 

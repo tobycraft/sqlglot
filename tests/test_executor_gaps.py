@@ -3,14 +3,18 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here are marked ``xfail(strict=True)``, asserting the
+Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). Most gaps found during that survey have been
-fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
-pyproject.toml while it's under active development) and are kept below as
-plain regression guards.
+the newly-supported construct). There are none open right now - every gap
+found during that survey has been fixed in the local sqlglot checkout
+(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
+development); the tests below are plain regression guards. That includes one
+genuine regression (not a new gap): a since-landed fix for a narrow
+nested-derived-table case briefly broke plain chained CTEs (see
+test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
+for real.
 """
 
 from __future__ import annotations
@@ -440,22 +444,11 @@ def test_nested_derived_table_joined_to_another_table():
 # drop the outer `WHERE rn = 1` wrapper and it works fine even with the
 # GROUP BY in place - it took the aggregate-under-window-under-wrapper-
 # under-JOIN combination together to raise a `KeyError` naming an
-# auto-generated alias (e.g. "_1").
+# auto-generated alias (e.g. "_1"). Fixed upstream (repointing the stale
+# alias in a doubly-nested derived table join); kept as a regression guard.
 #
-# Root cause was in the planner: a CTE's own `step.name = cte.alias` rename
-# (distinct from the pass-through-derived-table rename in Scan.from_expression)
-# never repointed the CTE body's projections/condition, so a Window step whose
-# projections were still qualified with its pre-CTE-rename alias (e.g. "_1")
-# had nothing registered under that name downstream. An initial attempt at
-# fixing just that regressed plain chained CTEs (see
-# test_chained_ctes_regressed_by_nested_derived_table_fix below for why); the
-# real fix pairs the planner-side repoint with a second, narrower executor
-# gap: PythonExecutor's `scan()`/`join()` only ever registered their context
-# under the step's dependency name (`source`/`source_name`), never under
-# `step.name` itself - fine as long as the two stayed equal, which they
-# always had before. Both now alias `step.name` onto the same table whenever
-# it differs from the dependency name. Fixed upstream; kept as a regression
-# guard.
+# NOTE: that same fix commit introduced a severe, unrelated regression -
+# see test_chained_ctes_regressed_by_nested_derived_table_fix below.
 
 
 def test_aggregate_fed_window_under_nested_wrapper_joined_to_another_table():
@@ -481,24 +474,20 @@ def test_aggregate_fed_window_under_nested_wrapper_joined_to_another_table():
     assert sorted(result.rows) == [(1, 1), (1, 1), (2, 1)]
 
 
-# --- Fixed: plain chained CTEs, no nesting at all ---------------------------
-# An initial fix for
-# test_aggregate_fed_window_under_nested_wrapper_joined_to_another_table above
-# (repointing a CTE's stale projection/condition qualifiers on rename) broke
-# this far more common shape: a plain chain of CTEs, each just `SELECT ...
-# FROM <previous CTE>` - no un-merged nested derived table, no window, no
-# aggregate, nothing exotic. Two CTEs chained is already enough (`WITH a AS
-# (...), b AS (SELECT a.x FROM a) SELECT * FROM b`); one CTE alone is fine.
-#
-# Here, CTE `b`'s body is `SELECT a.code FROM a` - a plain reference to
-# another CTE by name, not a pass-through-derived-table unwrap. Its Scan step
-# already has `.name == "a"` (the local FROM alias) before the CTE-level
-# rename changes it to "b"; repointing its projections/condition from "a" to
-# "b" broke them, since "a" (not "b") is what CTE `a`'s own dependency
-# actually registers at runtime. Fixed by having `PythonExecutor.scan()` (like
-# `join()` above) alias `step.name` onto the same table as the dependency
-# name whenever the two differ, so both the pre- and post-rename qualifier
-# resolve.
+# --- Fixed: REGRESSION - plain chained CTEs, no nesting at all --------------
+# Not a new gap - a severe regression, introduced by the very commit that
+# fixed test_aggregate_fed_window_under_nested_wrapper_joined_to_another_table
+# above ("repoint stale alias in doubly-nested derived table joins"). Found
+# stress-testing sqlcov against a real Athena CTAS pipeline: a plain chain of
+# CTEs, each just `SELECT ... FROM <previous CTE>` - no un-merged nested
+# derived table, no window, no aggregate, nothing exotic. Two CTEs chained
+# was already enough (`WITH a AS (...), b AS (SELECT a.x FROM a) SELECT *
+# FROM b`); one CTE alone was fine. This was about as common a SQL shape as
+# exists, so this regression was far more damaging than the narrow case the
+# commit fixed - it also took down sqlcov's own
+# test_sqlcov_gaps.py::test_case_tracked_through_chained_and_diamond_ctes,
+# which is now un-xfailed too. Fixed upstream for real this time; kept as a
+# regression guard.
 
 
 def test_chained_ctes_regressed_by_nested_derived_table_fix():
@@ -508,6 +497,53 @@ def test_chained_ctes_regressed_by_nested_derived_table_fix():
             "WITH a AS (SELECT code FROM t), b AS (SELECT a.code FROM a) SELECT * FROM b",
             dialect="presto",
         ),
+        schema=schema,
+        dialect="presto",
+    )
+    tree = annotate_types(tree, schema=schema, dialect="presto")
+    tables = ensure_tables({"t": [{"code": 1}, {"code": 2}]}, dialect="presto")
+    result = PythonExecutor(tables=tables).execute(Plan(tree))
+    assert sorted(result.rows) == [(1,), (2,)]
+
+
+# --- Fixed: an un-merged derived table that renames a column ----------------
+# The true root cause behind every "nested derived table" KeyError above and
+# the "'flag_last_row'"/"'flag_rows_to_remove'" crashes found stress-testing
+# sqlcov against a real Athena CTAS - none of those fixes actually reached
+# it. `Scan.from_expression` in planner.py handled `SELECT ... FROM
+# (subquery)` by reusing the subquery's own inner Step wholesale: it renamed
+# the inner Step to the subquery's alias and returned it directly. But
+# `Step.from_expression` (the caller) then built the *enclosing* SELECT's own
+# projections from its own expression list and unconditionally overwrote
+# `step.projections` with them - discarding the inner Step's real, computed
+# projections. That's invisible when the derived table is a bare passthrough
+# (`SELECT code FROM t`, no rename): the outer's projections reference the
+# same column name the raw table already has, so evaluation limps along by
+# coincidence. The instant the derived table renames or computes a column
+# (`SELECT code AS x FROM t`), the outer's projections reference a column
+# ("x") that was never actually computed by anything, anywhere - a bare
+# `KeyError` on that name at execution time, regardless of nesting depth
+# (one level was already enough) or whether a JOIN/window/aggregate was
+# layered on top (none of those were necessary either - they just happened
+# to be what the earlier, narrower fixes above targeted).
+#
+# Fixed by no longer renaming/reusing the inner Step in place: `Scan.
+# from_expression` now wires it in as a genuine dependency, exactly the way
+# a CTE reference already worked correctly (see the `with_` handling and the
+# plain-`exp.Table` branch in the same function) - the executor's existing
+# "scan a by-name dependency" path (`PythonExecutor.scan`) then evaluates the
+# outer SELECT's projections against the inner Step's real, already-computed
+# output, the same mechanism that made CTE renames work all along.
+#
+# Found stress-testing sqlcov against a real Athena CTAS pipeline: an SCD
+# dedup chain of several `SELECT ... FROM (SELECT ... FROM (...))` layers,
+# each renaming/computing a column the next layer depends on.
+
+
+def test_renamed_column_in_unmerged_derived_table():
+    schema = {"t": {"code": "BIGINT"}}
+    tree = qualify(
+        sqlglot.parse_one("SELECT * FROM (SELECT code AS x FROM t)", dialect="presto"),
         schema=schema,
         dialect="presto",
     )
