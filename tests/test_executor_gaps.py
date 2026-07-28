@@ -3,16 +3,16 @@ in sqlcov's own coverage tracking - see test_sqlcov_gaps.py), found by
 stress-testing sqlcov against a large production Athena query (not included
 in this repo).
 
-Still-open gaps here are marked ``xfail(strict=True)``, asserting the
+Still-open gaps here would be marked ``xfail(strict=True)``, asserting the
 *correct* result sqlglot cannot yet produce; XPASS then fails the suite
 (dropping the marker, at that point, is also the cue to check whether
 sqlcov's own coverage surface - predicates/CASE arms - should widen to use
-the newly-supported construct). All gaps found during that survey have been
-fixed in the local sqlglot checkout (tracked via ``[tool.uv.sources]`` in
-pyproject.toml while it's under active development) and are kept below as
-plain regression guards, including one genuine regression (not a new gap):
-a since-landed fix for a narrow nested-derived-table case briefly broke
-plain chained CTEs (see
+the newly-supported construct). There are none open right now - every gap
+found during that survey has been fixed in the local sqlglot checkout
+(tracked via ``[tool.uv.sources]`` in pyproject.toml while it's under active
+development); the tests below are plain regression guards. That includes
+one genuine regression (not a new gap): a since-landed fix for a narrow
+nested-derived-table case briefly broke plain chained CTEs (see
 test_chained_ctes_regressed_by_nested_derived_table_fix) before being fixed
 for real.
 """
@@ -790,31 +790,15 @@ def test_correlated_not_exists_subquery():
 
 
 # --- Fixed: a correlated NOT EXISTS subquery whose condition is CONTAINS ---
-# A more specific variant of the already-fixed test_correlated_not_exists_subquery
-# above, not covered by that fix: the bare-equality correlated NOT EXISTS
-# compiled fine, but the production query's exact shape - the subquery's
-# WHERE is `CONTAINS(array_column, outer_column)`, not a plain equality -
-# still failed the same way: `not EXISTS(SELECT 1 FROM "u" AS "u" WHERE
-# ARRAYCONTAINS(scope["u"]["arr"], scope["t"]["id"])), line 1` was emitted as
-# literal SQL/pseudo-Python text rather than valid Python, raising the
-# identical `SyntaxError`.
-#
-# Root cause: `unnest_subqueries.decorrelate` located the correlating
-# predicate for an external column via `column.find_ancestor(exp.Predicate)`.
-# `CONTAINS(...)` parses to `exp.ArrayContains`, which - unlike EQ/GT/etc -
-# is a plain `Binary`/`Func`, not an `exp.Predicate`, so the lookup walked
-# straight past it and landed on the enclosing `EXISTS` instead, which isn't
-# a `Binary`, so decorrelation bailed out and left the raw correlated
-# `exp.Exists` node for the (nonexistent) SQL-text codegen path to choke on.
-# Separately, decorrelation as a whole required at least one equality key
-# among the correlated columns before doing anything, which a bare
-# `CONTAINS` predicate (with no equi-join key at all) could never satisfy.
-#
-# Fixed by teaching the predicate lookup to also recognize `exp.ArrayContains`
-# as a correlating condition, and loosening the "needs an EQ key" gate to
-# "needs at least one key of any kind" - the existing non-equality-key
-# machinery (aggregate the array, then `ARRAY_ANY(nested, _x -> CONTAINS(_x,
-# outer_column))`) already handled the rest correctly once it was reachable.
+# A more specific variant of the fixed test_correlated_not_exists_subquery
+# above, not covered by that fix at the time: the bare-equality correlated
+# NOT EXISTS compiled fine, but the production query's exact shape - the
+# subquery's WHERE is `CONTAINS(array_column, outer_column)`, not a plain
+# equality - still failed the same way: `not EXISTS(SELECT 1 FROM "u" AS "u"
+# WHERE ARRAYCONTAINS(scope["u"]["arr"], scope["t"]["id"])), line 1` was
+# emitted as literal SQL/pseudo-Python text rather than valid Python,
+# raising the identical `SyntaxError`. Fixed upstream; kept as a regression
+# guard alongside the plain-equality case.
 #
 # Found stress-testing sqlcov against a real Athena CTAS: `WHERE NOT
 # EXISTS(SELECT 1 FROM h_inrr_tmp AS sub WHERE CONTAINS(sub.visited_ids,
@@ -835,3 +819,26 @@ def test_correlated_not_exists_with_array_contains():
     tables = ensure_tables({"t": [{"id": 1}, {"id": 2}], "u": [{"arr": [1, 3]}]}, dialect="presto")
     result = PythonExecutor(tables=tables).execute(Plan(tree))
     assert sorted(result.rows) == [(2,)]
+
+
+# --- Open: a CASE expression used as another CASE's WHEN condition ---------
+# `_case_sql` in sqlglot/generators/python.py splices a WHEN's condition into
+# the ternary chain unparenthesized: `chain = f"{true} if {condition} else
+# ({chain})"`. When `condition` itself compiles to a Python ternary - i.e.
+# the WHEN test is itself a CASE expression - the emitted text is a bare,
+# unparenthesized "X if Y else Z" sitting where Python's grammar expects a
+# plain (non-conditional) expression, e.g. `1 if True if a else False else
+# 0`. `compile()` rejects that with "expected 'else' after 'if'
+# expression" - a SyntaxError, not a runtime error, so it fails regardless of
+# the row data. Found stress-testing sqlcov against a real Athena CTAS whose
+# WHEN condition tested another CASE's result directly. Fixed by
+# parenthesizing the WHEN condition in `_case_sql`.
+
+
+def test_case_as_when_condition():
+    sql = (
+        "SELECT CASE WHEN (CASE WHEN a = 1 THEN TRUE ELSE FALSE END) AND b = 2 "
+        "THEN 1 ELSE 0 END AS x FROM t"
+    )
+    res = execute(sql, tables={"t": [{"a": 1, "b": 2}]})
+    assert list(res.rows) == [(1,)]

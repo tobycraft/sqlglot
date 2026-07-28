@@ -40,7 +40,7 @@ def _case_sql(self, expression):
     for e in reversed(expression.args["ifs"]):
         true = self.sql(e, "true")
         condition = self.sql(e, "this")
-        condition = f"{this} == ({condition})" if this else condition
+        condition = f"{this} == ({condition})" if this else f"({condition})"
         chain = f"{true} if {condition} else ({chain})"
 
     return chain
