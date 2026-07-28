@@ -11,6 +11,67 @@ from sqlglot.executor.table import RowReader, Table
 from sqlglot.generators.python import PythonGenerator
 
 
+class _NullSafeKey:
+    """A sort key for an ascending ORDER BY column - NULLS LAST, matching the
+    common default (e.g. Trino's) - without ever calling the wrapped value's
+    own comparison against another ``None``. Unlike the once-used ``(v is
+    None, v)`` idiom, which still compares `v` itself as a tuple-equality
+    tiebreaker whenever two rows' `v is None` flags match, so two `None`s (a
+    common case: multiple rows sharing an unset ORDER BY column) raised
+    `TypeError: '<' not supported between instances of 'NoneType' and
+    'NoneType'`. See ``PythonExecutor.window``.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+    def __lt__(self, other):
+        if self.value is None:
+            return False
+        if other.value is None:
+            return True
+        return self.value < other.value
+
+
+class _AliasedRowReader:
+    """A read-only view of another `RowReader`'s *current* row, scoped to just
+    one alias' own `column_range` - lets two aliases of the same underlying
+    columns (e.g. two joins of the same reference table) each resolve a
+    same-named column to their own value, while `row` always reflects
+    whatever row `source` is currently on (never a frozen copy), so it stays
+    correct as the driving iteration advances - see `PythonExecutor.window`.
+    """
+
+    def __init__(self, source, columns, column_range):
+        self._source = source
+        self.columns = {
+            column: i for i, column in enumerate(columns) if not column_range or i in column_range
+        }
+
+    @property
+    def row(self):
+        return self._source.row
+
+    def __getitem__(self, column):
+        return self.row[self.columns[column]]
+
+
+def _hashable_key(value):
+    """A join/group key may legitimately be an ARRAY (Presto/Athena allow array
+    equality, e.g. in an equi-join), which the executor represents as a Python
+    ``list`` - not hashable, so it can't be used directly as a dict key. Recurse
+    into lists (and tuples, for nested arrays) and convert them to tuples so the
+    resulting key is always hashable, without changing equality semantics."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_key(v) for v in value)
+    return value
+
+
 class PythonExecutor:
     def __init__(self, env=None, tables=None, recursion_limit=10_000):
         self.generator = Python().generator(identify=True, comments=False)
@@ -229,6 +290,7 @@ class PythonExecutor:
             start = max(r.stop for r in column_ranges.values())
 
             unnest = join.get("unnest")
+            already_filtered = False
             if unnest is not None:
                 table = self.lateral_unnest_join(unnest, source_context)
                 column_ranges[name] = range(start, len(table.columns))
@@ -238,9 +300,18 @@ class PythonExecutor:
                 join_context = self.context({name: table})
 
                 if join.get("source_key"):
+                    # hash_join already applies join["condition"] itself (see
+                    # its docstring) - correctly, for LEFT/RIGHT, *before*
+                    # deciding whether a source row has any match at all,
+                    # rather than as a blanket filter afterward that would
+                    # wrongly strip out the NULL-padded rows it just added.
                     table = self.hash_join(join, source_context, join_context)
+                    already_filtered = True
                 else:
+                    # No extractable equi-join key - nested_loop_join applies
+                    # the *entire* condition itself, same reasoning as above.
                     table = self.nested_loop_join(join, source_context, join_context)
+                    already_filtered = True
 
             source_context = self.context(
                 {
@@ -248,9 +319,10 @@ class PythonExecutor:
                     for name, column_range in column_ranges.items()
                 }
             )
-            condition = self.generate(join["condition"])
-            if condition:
-                source_context.filter(condition)
+            if not already_filtered:
+                condition = self.generate(join["condition"])
+                if condition:
+                    source_context.filter(condition)
 
         if step.name and step.name != source and step.name not in source_context.tables:
             # a CTE-level rename (a pass-through CTE body whose outermost step is
@@ -295,18 +367,53 @@ class PythonExecutor:
 
         table = Table(source_context.columns + tuple(columns))
         for reader, ctx in source_context:
-            arrays = [ctx.eval(expr) for expr in exprs]
+            # A NULL array (as opposed to an empty one) explodes to zero rows,
+            # same as Presto/Trino's UNNEST - without this, zip_longest(*arrays)
+            # blows up trying to iterate a None.
+            arrays = [ctx.eval(expr) or [] for expr in exprs]
             for i, values in enumerate(itertools.zip_longest(*arrays)):
                 table.append(reader.row + (values + (i + 1,) if offset else values))
 
         return table
 
-    def nested_loop_join(self, _join, source_context, join_context):
-        table = Table(source_context.columns + join_context.columns)
+    def nested_loop_join(self, join, source_context, join_context):
+        """A join with no extractable equi-join key at all (e.g. every ON-clause
+        conjunct is a non-equality, like a date-range check) - the entire
+        condition is the "residual" `hash_join` would otherwise apply after
+        key-bucketing. With no key to bucket by, every source row is tested
+        against every join row directly; LEFT/RIGHT NULL-padding follows the
+        same rule as `hash_join`: a source row with zero matches still gets
+        one output row, padded with NULLs on the other side, instead of
+        vanishing - the same regression class `hash_join`'s residual matching
+        already guards against (see its docstring), just with no key to skip
+        the O(n*m) comparison.
+        """
+        a_group = [reader.row for reader, _ in source_context]
+        b_group = [reader.row for reader, _ in join_context]
 
-        for reader_a, _ in source_context:
-            for reader_b, _ in join_context:
-                table.append(reader_a.row + reader_b.row)
+        left = join.get("side") == "LEFT"
+        right = join.get("side") == "RIGHT"
+
+        table = Table(source_context.columns + join_context.columns)
+        null = (None,) * len(join_context.columns if left else source_context.columns)
+
+        condition = join.get("condition")
+        matches = None
+        if condition is not None and self.generate(condition) != "True":
+            matches = self._residual_match_fn(condition, source_context, join_context)
+
+        if left:
+            for a_row in a_group:
+                real = [a_row + b_row for b_row in b_group if matches is None or matches(a_row, b_row)]
+                table.rows.extend(real if real else [a_row + null])
+        elif right:
+            for b_row in b_group:
+                real = [a_row + b_row for a_row in a_group if matches is None or matches(a_row, b_row)]
+                table.rows.extend(real if real else [null + b_row])
+        else:
+            for a_row, b_row in itertools.product(a_group, b_group):
+                if matches is None or matches(a_row, b_row):
+                    table.append(a_row + b_row)
 
         return table
 
@@ -319,14 +426,42 @@ class PythonExecutor:
         results = collections.defaultdict(lambda: ([], []))
 
         for reader, ctx in source_context:
-            results[ctx.eval_tuple(source_key)][0].append(reader.row)
+            results[_hashable_key(ctx.eval_tuple(source_key))][0].append(reader.row)
         for reader, ctx in join_context:
-            results[ctx.eval_tuple(join_key)][1].append(reader.row)
+            results[_hashable_key(ctx.eval_tuple(join_key))][1].append(reader.row)
 
         table = Table(source_context.columns + join_context.columns)
         nulls = [(None,) * len(join_context.columns if left else source_context.columns)]
 
+        # Any ON-clause conjunct `join_condition` couldn't fold into the hash
+        # key above (a non-equality, e.g. a date-range check, or an equality
+        # it couldn't isolate to one side) is left over as `join["condition"]`
+        # - see `join()`'s docstring-less comment at the call site for why that
+        # can't just be a blanket post-join filter for LEFT/RIGHT: a bucket
+        # here is already correctly NULL-padded (or not) based on the key
+        # alone, and a residual test needs to run *before* that NULL-padding
+        # decision, not after, or it ends up testing the padding itself.
+        residual = join.get("condition")
+        residual_matches = None
+        if residual is not None and self.generate(residual) != "True":
+            residual_matches = self._residual_match_fn(residual, source_context, join_context)
+
         for a_group, b_group in results.values():
+            if residual_matches is not None:
+                if left:
+                    for a_row in a_group:
+                        real = [a_row + b_row for b_row in b_group if residual_matches(a_row, b_row)]
+                        table.rows.extend(real if real else [a_row + nulls[0]])
+                elif right:
+                    for b_row in b_group:
+                        real = [a_row + b_row for a_row in a_group if residual_matches(a_row, b_row)]
+                        table.rows.extend(real if real else [nulls[0] + b_row])
+                else:
+                    for a_row, b_row in itertools.product(a_group, b_group):
+                        if residual_matches(a_row, b_row):
+                            table.append(a_row + b_row)
+                continue
+
             if left:
                 b_group = b_group or nulls
             elif right:
@@ -336,6 +471,38 @@ class PythonExecutor:
                 table.append(a_row + b_row)
 
         return table
+
+    def _residual_match_fn(self, condition, source_context, join_context):
+        """Build a per-`(a_row, b_row)` test for a JOIN's residual ON-clause
+        condition (whatever `join_condition` left after extracting the hash
+        key), evaluated the same way a real query row would see it - via a
+        merged context spanning both sides, so column references on either
+        alias resolve correctly. Used by `hash_join` to test LEFT/RIGHT
+        candidate pairs *before* deciding whether a source row has any match
+        at all, instead of filtering the (already NULL-padded) joined table
+        afterward.
+        """
+        residual_code = self.generate(condition)
+        n_source = len(source_context.columns)
+        combined_columns = source_context.columns + join_context.columns
+
+        # Reused as-is: each existing source-side Table already has `columns`
+        # set to its own full (pre-join) combined row and a `column_range`
+        # that's still valid unchanged - we're only appending columns after
+        # it, not renumbering what's already there.
+        tables = dict(source_context.tables)
+        for name, jtable in join_context.tables.items():
+            start = n_source + (jtable.column_range.start if jtable.column_range else 0)
+            width = len(jtable.column_range) if jtable.column_range else len(jtable.columns)
+            tables[name] = Table(combined_columns, [], range(start, start + width))
+
+        residual_ctx = self.context(tables)
+
+        def matches(a_row, b_row):
+            residual_ctx.set_row(a_row + b_row)
+            return bool(residual_ctx.eval(residual_code))
+
+        return matches
 
     def window(self, step, context):
         rows = [reader.row for reader, _ in context]
@@ -353,7 +520,7 @@ class PythonExecutor:
             partitions = collections.defaultdict(list)
             for i in range(n):
                 context.set_index(i)
-                partitions[context.eval_tuple(partition_by)].append(i)
+                partitions[_hashable_key(context.eval_tuple(partition_by))].append(i)
 
             for indices in partitions.values():
                 keys = None
@@ -363,29 +530,94 @@ class PythonExecutor:
                     for i in indices:
                         context.set_index(i)
                         evaluated.append((i, context.eval_tuple(order_by)))
-                    evaluated.sort(key=lambda pair: tuple((v is None, v) for v in pair[1]))
+                    evaluated.sort(key=lambda pair: tuple(_NullSafeKey(v) for v in pair[1]))
                     indices = [i for i, _ in evaluated]
                     keys = [key for _, key in evaluated]
 
-                for i, value in zip(indices, self._window_values(func, indices, keys, context)):
+                spec = window.args.get("spec")
+                for i, value in zip(
+                    indices, self._window_values(func, indices, keys, context, spec)
+                ):
                     results[name][i] = value
 
         table = Table(list(context.columns) + names)
         for i in range(n):
             table.append(rows[i] + tuple(results[name][i] for name in names))
 
-        context = self.context({step.name: table, **{name: table for name in context.tables}})
+        # Every pre-existing alias keeps pointing at the *same* `table` object
+        # (not a copy) - `context.table_iter`/`set_index` only ever advance
+        # whichever one Table object `step.source` names, so every alias must
+        # be that identical object for its row to stay in lockstep once
+        # iteration resumes (this is also how the pre-fix code behaved, for
+        # any case where every alias already shared one physical Scan table).
+        #
+        # But two joined aliases of the same underlying table (e.g. two
+        # lookups against one shared reference table) contribute identically
+        # -named columns to the merged column list; naively giving every
+        # alias key an unrestricted (column_range-less) reader onto that
+        # shared `table` would make `RowReader` build its name->index map
+        # over *all* columns, so a duplicate name resolves to whichever
+        # alias's column happened to land last - e.g. `b.tgt` shadowing
+        # `a.tgt` - silently returning the wrong alias's value instead of
+        # raising. So every alias other than `step.name` instead gets an
+        # `_AliasedRowReader`: it resolves column names through that alias's
+        # own pre-window `column_range` (set up by `join()`), while always
+        # reading the *current* row live off the shared table's own reader -
+        # never a frozen copy - so it stays correct as iteration advances.
+        orig_ranges = {name: t.column_range for name, t in context.tables.items()}
+        tables = {name: table for name in context.tables}
+        tables[step.name] = table
+        context = self.context(tables)
+        for name, column_range in orig_ranges.items():
+            if name != step.name and column_range:
+                context.row_readers[name] = _AliasedRowReader(
+                    table.reader, table.columns, column_range
+                )
+        context.env["scope"] = context.row_readers
 
         if step.projections or step.condition:
             return self.scan(step, context)
         return context
 
-    def _window_values(self, func, indices, keys, context):
+    def _frame_bound(self, value, side, pos, width, context):
+        """Resolve one end (start or end) of a ``ROWS BETWEEN`` frame to a row
+        position within the partition, clamped to ``[0, width - 1]``.
+
+        ``value``/``side`` come straight from the parsed ``WindowSpec``: `value`
+        is the literal string ``"UNBOUNDED"``, the literal string ``"CURRENT
+        ROW"``, an expression evaluating to a non-negative row-offset, or
+        ``None`` (meaning this end of the frame was omitted, e.g. no ``AND ...``
+        clause - defaults to ``CURRENT ROW``); `side` is ``"PRECEDING"``,
+        ``"FOLLOWING"``, or ``None`` (only meaningful together with a numeric
+        `value`).
+        """
+        if value is None or value == "CURRENT ROW":
+            bound = pos
+        elif value == "UNBOUNDED":
+            bound = 0 if side == "PRECEDING" else width - 1
+        else:
+            offset = context.eval(self.generate(value)) if isinstance(value, exp.Expr) else value
+            bound = pos - offset if side == "PRECEDING" else pos + offset
+        return max(0, min(width - 1, bound))
+
+    def _window_values(self, func, indices, keys, context, spec=None):
         """Compute the values of a single window function across one partition.
 
         `indices` are the row indices of the partition, already sorted by the window's
         ORDER BY (if any); `keys` are the corresponding evaluated ORDER BY tuples.
+
+        `spec` is the window's ``WindowSpec`` (the ``ROWS BETWEEN ...`` clause),
+        or ``None`` if the window has no explicit frame - in which case a
+        generic aggregate below is computed over the whole partition, matching
+        this executor's long-standing (frame-less) behavior. An explicit
+        ``ROWS`` frame is honored per-row; ``RANGE``/``GROUPS`` frames (which
+        need peer-row grouping by ORDER BY value, not just position) fall back
+        to the same whole-partition behavior rather than risk a wrong slice.
         """
+        ignore_nulls = isinstance(func, exp.IgnoreNulls)
+        if ignore_nulls or isinstance(func, exp.RespectNulls):
+            func = func.this
+
         width = len(indices)
 
         if isinstance(func, exp.RowNumber):
@@ -427,8 +659,16 @@ class PythonExecutor:
 
         if isinstance(func, (exp.FirstValue, exp.LastValue)):
             this = self.generate(func.this)
-            if indices:
-                index = indices[0] if isinstance(func, exp.FirstValue) else indices[-1]
+            candidates = indices
+            if ignore_nulls:
+                non_null = []
+                for i in indices:
+                    context.set_index(i)
+                    if context.eval(this) is not None:
+                        non_null.append(i)
+                candidates = non_null
+            if candidates:
+                index = candidates[0] if isinstance(func, exp.FirstValue) else candidates[-1]
                 context.set_index(index)
                 value = context.eval(this)
             else:
@@ -447,6 +687,14 @@ class PythonExecutor:
             for i in indices:
                 context.set_index(i)
                 operands.append(context.eval(this))
+
+        if spec is not None and spec.args.get("kind") == "ROWS":
+            values = []
+            for pos in range(width):
+                lo = self._frame_bound(spec.args.get("start"), spec.args.get("start_side"), pos, width, context)
+                hi = self._frame_bound(spec.args.get("end"), spec.args.get("end_side"), pos, width, context)
+                values.append(agg(operands[lo : hi + 1]) if lo <= hi else None)
+            return values
 
         return [agg(operands)] * width
 

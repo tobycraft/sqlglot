@@ -842,3 +842,283 @@ def test_case_as_when_condition():
     )
     res = execute(sql, tables={"t": [{"a": 1, "b": 2}]})
     assert list(res.rows) == [(1,)]
+
+
+# --- Fixed: an explicit ROWS BETWEEN frame was silently ignored -----------
+# `PythonExecutor._window_values` (sqlglot/executor/python.py) computed a
+# generic aggregate window function (SUM, MIN, MAX, COUNT, AVG, ...) as
+# `[agg(operands)] * width` - the aggregate over *every* row in the
+# partition, broadcast unchanged to every row - regardless of any `ROWS
+# BETWEEN ... AND ...` frame clause on the window. A running/cumulative
+# frame like `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (extremely
+# common for running totals, "has this ever happened up to this point"
+# flags, etc.) instead silently returned the same whole-partition value for
+# every row - wrong data, not an error, so it was easy to miss. Found
+# stress-testing sqlcov against a real Athena CTAS that computed a
+# cumulative SUM per account ordered by month to detect a balance that had
+# gone to zero and stayed there; every row got the account's overall sum
+# instead of a running one. Fixed by resolving each row's `ROWS` frame to a
+# start/end position (via the new `_frame_bound` helper) and slicing
+# `operands` to that window before calling `agg`, instead of always using
+# the whole partition; `RANGE`/`GROUPS` frames still fall back to the old
+# whole-partition behavior, since they need peer-row grouping by ORDER BY
+# value rather than a plain positional slice.
+def test_rows_between_frame_is_respected():
+    sql = (
+        "SELECT a, b, "
+        "SUM(b) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum, "
+        "MIN(b) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_min, "
+        "MIN(b) OVER (PARTITION BY a ORDER BY b DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_min_desc "
+        "FROM t"
+    )
+    res = execute(
+        sql,
+        tables={"t": [{"a": 1, "b": 10}, {"a": 1, "b": 20}, {"a": 1, "b": 5}]},
+        dialect="presto",
+    )
+    rows = {row[1]: row for row in res.rows}
+    # ordered by b ASC: 5, 10, 20 -> running sums 5, 15, 30; running mins (ASC) 5, 5, 5
+    # ordered by b DESC: 20, 10, 5 -> running mins (DESC) 20, 10, 5
+    assert rows[5][2:] == (5, 5, 5)
+    assert rows[10][2:] == (15, 5, 10)
+    assert rows[20][2:] == (35, 5, 20)
+
+
+# --- Fixed: a window function collapsed two same-named joined columns -----
+# `PythonExecutor.window` (sqlglot/executor/python.py) rebuilds a fresh,
+# range-less `Table` after computing a window function, then pointed *every*
+# table alias in scope - not just the window step's own name - at that same
+# unrestricted table. That's fine when every alias already shared one
+# physical row (the common case), but when the preceding step joined two
+# *different* aliases of the same underlying table (e.g. two lookups against
+# one shared reference table, both contributing identically-named columns to
+# the merged column list), a range-less `RowReader` builds its name->index
+# map over *every* column - so the duplicate name resolves to whichever
+# alias's column happened to land last, silently returning the wrong
+# alias's value (e.g. `b.tgt` for both `a.tgt` and `b.tgt`) instead of
+# raising. Only surfaced when some *other* projection in the same SELECT
+# also used a window function - otherwise the planner drops the Window step
+# as dead code, so a query needs both to fail. Found stress-testing sqlcov
+# against a real Athena CTAS that joined a shared code/description lookup
+# table twice (once per source column) inside a CTE that also computed a
+# DENSE_RANK() - both lookup values ended up equal to the second join's
+# result. Fixed by giving every alias other than the window step's own name
+# a new `_AliasedRowReader`, resolving column names through that alias's own
+# pre-window `column_range` while always reading the live current row off
+# the shared table - preserving both per-alias disambiguation and the
+# existing invariant that advancing iteration through any one alias name
+# keeps every alias in lockstep.
+def test_window_function_preserves_distinct_joined_aliases():
+    sql = (
+        "SELECT m.id, DENSE_RANK() OVER (PARTITION BY m.id ORDER BY m.id) AS rnk, "
+        "la.tgt AS a_val, lb.tgt AS b_val "
+        "FROM m "
+        "LEFT JOIN lookup AS la ON m.code_a = la.src AND la.col = 'alpha' "
+        "LEFT JOIN lookup AS lb ON m.code_b = lb.src AND lb.col = 'beta'"
+    )
+    tables = {
+        "m": [{"id": 1, "code_a": "A1", "code_b": "B1"}, {"id": 2, "code_a": "A2", "code_b": "B2"}],
+        "lookup": [
+            {"src": "A1", "col": "alpha", "tgt": "fixed"},
+            {"src": "A2", "col": "alpha", "tgt": "variable"},
+            {"src": "B1", "col": "beta", "tgt": "io"},
+            {"src": "B2", "col": "beta", "tgt": "pi"},
+        ],
+    }
+    res = execute(sql, tables=tables, dialect="presto")
+    rows = {row[0]: row for row in res.rows}
+    assert rows[1][1:] == (1, "fixed", "io")
+    assert rows[2][1:] == (1, "variable", "pi")
+
+
+# --- Fixed: a LEFT/RIGHT JOIN with a non-equality residual ON condition ----
+# used to drop unmatched outer rows entirely instead of NULL-padding them.
+# `PythonExecutor.hash_join` (sqlglot/executor/python.py) buckets rows purely
+# by the equi-join key extracted by `join_condition`, NULL-pads any bucket
+# whose other side is empty (correct outer-join behavior for the KEY alone),
+# then `PythonExecutor.join` applied whatever residual ON-clause survived key
+# extraction (any non-equality conjunct, e.g. `b.upd <= a.closure`, or an
+# equality that couldn't be pulled into the hash key) as a blanket
+# `Context.filter` over the *entire* joined table - including the rows that
+# were just NULL-padded because there was no key match at all. That filter
+# evaluated the residual against the NULL-padded columns, got NULL/false,
+# and threw the outer row away - so a LEFT JOIN with any extra ON condition
+# beyond a plain equality silently behaved like an INNER JOIN whenever the
+# left row had no match. Found stress-testing sqlcov against a real Athena
+# CTAS joining a corrections/refinance-reason table via
+# `LEFT JOIN fmsr ON mrg.id = fmsr.id AND (fmsr.upd <= mrg.closure + INTERVAL
+# '90' DAY OR fmsr.upd <= DATE '2025-10-31')` - adding new fixture rows with
+# no matching fmsr counterpart made them vanish from the join output entirely
+# instead of appearing with the fmsr columns NULL. Fixed by having
+# `hash_join` test the residual itself, per candidate `(a_row, b_row)` pair
+# via the new `_residual_match_fn` helper, *before* deciding whether a source
+# row has any match at all - not as a filter over the already-decided,
+# already NULL-padded result.
+def test_left_join_residual_condition_preserves_unmatched_rows():
+    sql = (
+        "SELECT a.id, b.upd "
+        "FROM a "
+        "LEFT JOIN b ON a.id = b.id AND b.upd <= a.closure"
+    )
+    tables = {
+        "a": [{"id": 1, "closure": 5}, {"id": 2, "closure": 5}, {"id": 3, "closure": 5}],
+        "b": [{"id": 1, "upd": 5}],
+    }
+    res = execute(sql, tables=tables, dialect="presto")
+    rows = {row[0]: row for row in res.rows}
+    assert rows[1] == (1, 5)
+    assert rows[2] == (2, None)
+    assert rows[3] == (3, None)
+
+
+# --- Fixed: DOUBLE / DOUBLE division truncated to an integer under a -------
+# TYPED_DIVISION dialect (Presto/Athena/Postgres/...). `_div_sql`
+# (sqlglot/generators/python.py) picked the executor's `TYPEDDIV` op - which
+# does `int(e / this)` (sqlglot/executor/env.py) - purely because
+# `e.args.get("typed")` is set on the `Div` node, and every division parses
+# with `typed=True` under these dialects (`Dialect.TYPED_DIVISION`), since
+# that flag only records "this dialect's `/` follows typed-division rules",
+# not "this particular division is between two integers". The optimizer's
+# own `annotate_types._annotate_div` gets this right - it only assigns the
+# division an integer result type when `typed` AND *both* operands are
+# already integer-typed - but the code generator never consulted that, so a
+# DOUBLE/DOUBLE (or DECIMAL/INT, etc.) division still got truncated to an
+# int, silently producing 0 instead of a fraction. Found stress-testing
+# sqlcov against a real Athena CTAS computing an interest-rate discount as
+# `CAST((-base_rate + rate) AS DECIMAL(20, 5)) / 100` - every row came out
+# as exactly 0 regardless of the actual rates. Fixed by having `_div_sql`
+# check both operands' annotated types (mirroring `_annotate_div`'s own
+# condition) before picking `TYPEDDIV` over the plain `DIV`.
+def test_typed_division_dialect_preserves_fractional_result():
+    res = execute(
+        "SELECT (-base + rate) / 100 AS discount FROM t",
+        tables={"t": [{"base": 50.0, "rate": 100.0}]},
+        dialect="presto",
+    )
+    assert res.rows == [(0.5,)]
+
+
+# --- Fixed: a LEFT/RIGHT JOIN with no equi-join key dropped unmatched rows -
+# `PythonExecutor.nested_loop_join` (sqlglot/executor/python.py) - used when
+# an ON-clause has no extractable equi-join key at all, e.g. every conjunct
+# is a non-equality like a date-range check - had no join-condition or
+# LEFT/RIGHT handling whatsoever: it built a bare, unconditional cross
+# product of every (source, join) row pair, leaving `join()`'s caller to
+# apply the *entire* ON-clause as a blanket post-join filter. For an INNER
+# join that's equivalent to a real inner join (filter a cross product), so
+# it went unnoticed; for a LEFT/RIGHT join it's exactly the same bug already
+# fixed for `hash_join` in `test_left_join_residual_condition_preserves_unmatched_rows`
+# above - the filter evaluates the condition against rows that were never
+# matched at all, gets NULL/false, and drops the outer row entirely instead
+# of NULL-padding it. Found stress-testing sqlcov against a real Athena CTAS
+# joining two derived tables (one filtered to "most recent row per account",
+# one to "earliest row per account" via a separate CTE) via `LEFT JOIN ...
+# ON new.open_date BETWEEN main.closure_date AND main.closure_date +
+# INTERVAL '5' DAY AND main.id <> new.id` - no equi-key at all, so every
+# account whose closure never lined up with another account's opening
+# vanished from the output entirely, instead of surviving with the joined
+# columns NULL. Fixed by giving `nested_loop_join` the same LEFT/RIGHT
+# NULL-padding treatment as `hash_join` (via the same `_residual_match_fn`
+# helper), testing the full condition per `(a_row, b_row)` pair directly
+# instead of bucketing by a key that doesn't exist here.
+def test_nested_loop_join_preserves_unmatched_outer_rows():
+    sql = (
+        "SELECT a.id AS a_id, b.id AS b_id "
+        "FROM (SELECT id, closure_date FROM a) AS a "
+        "LEFT JOIN (SELECT id, open_date FROM b) AS b "
+        "ON b.open_date > a.closure_date"
+    )
+    tables = {
+        "a": [{"id": 1, "closure_date": 10}, {"id": 2, "closure_date": 30}],
+        "b": [{"id": 3, "open_date": 20}],
+    }
+    res = execute(sql, tables=tables, dialect="presto")
+    rows = {row[0]: row for row in res.rows}
+    assert rows[1] == (1, 3)
+    assert rows[2] == (2, None)
+
+
+# --- Fixed: a window function alongside GROUP BY ran before aggregation ----
+# `planner.py` used to build the `Aggregate` step depending on a preceding
+# `Window` step whenever the SELECT list had both a GROUP BY and a window
+# function - regardless of whether the window function's arguments were
+# themselves GROUP BY keys (or otherwise already available
+# post-aggregation). That's backwards for this case: standard SQL evaluates
+# a window function *after* GROUP BY/aggregation - operating over the
+# query's grouped result set - not over the raw pre-aggregation rows.
+# Concretely, `PythonExecutor.aggregate` (sqlglot/executor/python.py) ended
+# up trying to read the window column (here `rn`) directly off its own
+# per-*row* input during `_project_and_filter`, but the column was computed
+# by the *preceding* Window step over ungrouped rows and never survived into
+# the Aggregate step's own output columns - `KeyError` on the window
+# column's name, not a wrong-value bug. Found stress-testing sqlcov against
+# a real Athena CTAS: a self-join aggregated with `ARRAY_AGG`/`GROUP BY 1, 2,
+# 3` that also computed `ROW_NUMBER() OVER (ORDER BY <the same three GROUP
+# BY key expressions>) AS group_no` in the same SELECT - this crashed
+# outright (not merely undercounted) the moment upstream fixture data made
+# the self-join actually produce rows, having gone unnoticed while that
+# join's input was always empty. Fixed by building `Aggregate` from the
+# pre-window step and `Window` *after* it (reversing the dependency) whenever
+# a GROUP BY or aggregation is present, rewriting each window body's column
+# references through the same GROUP-BY-key-to-aggregate-alias `intermediate`
+# map already applied to `projections`/`aggregate.condition` - so e.g.
+# `ORDER BY <group-by key expression>` resolves against the aggregated
+# output instead of rows that no longer exist by the time Window runs.
+def test_window_function_over_group_by_keys_runs_after_aggregation():
+    res = execute(
+        "SELECT t.a, COUNT(*) AS c, ROW_NUMBER() OVER (ORDER BY t.a) AS rn FROM t GROUP BY 1",
+        tables={"t": [{"a": 1}, {"a": 1}, {"a": 2}]},
+        dialect="presto",
+    )
+    rows = {row[0]: row for row in res.rows}
+    assert rows[1] == (1, 2, 1)
+    assert rows[2] == (2, 1, 2)
+
+
+# --- Fixed: a window ORDER BY column with two or more NULLs crashed --------
+# `PythonExecutor.window` (sqlglot/executor/python.py) sorted a partition's
+# rows for its ORDER BY using the idiom `(v is None, v)` per column - meant
+# to keep NULLs from ever being compared against a real value (`5 < None`
+# has no defined ordering in Python). But when two rows both have `v is
+# None` for the same column, their `(True, None)` keys are only *fully*
+# equal - `True == True` and `None == None` - so tuple comparison never
+# needs to fall back to `<`; in practice, though, `sort()`'s internal
+# comparisons don't always hit that fully-equal shortcut before trying `<`
+# on a still-tied prefix, so a partition with more than one NULL in the same
+# ORDER BY column intermittently raised `TypeError: '<' not supported
+# between instances of 'NoneType' and 'NoneType'`. A DESC column had it
+# worse: its value arrives already wrapped in `reverse_key` (used to invert
+# `<`), whose own `__lt__` did `other.obj < self.obj` unconditionally - no
+# NULL check at all, so it broke on *any* NULL, not just two. Found
+# stress-testing sqlcov against a real Athena CTAS: a Hogan-side account
+# table with genuinely unset dates being ranked with `DENSE_RANK() OVER
+# (ORDER BY closure_date)` - one NULL closure date was already a crash
+# (via `reverse_key`), and this surfaced only once upstream fixture changes
+# made that step run over real, non-empty, NULL-containing data for the
+# first time. Fixed by replacing the tuple idiom with a dedicated
+# `_NullSafeKey` class (NULLS LAST, matching common defaults like Trino's)
+# that never compares two `None`s via `<`, and by making `reverse_key` itself
+# NULL-aware (NULLS FIRST, the mirror image for a reversed/DESC column)
+# instead of assuming its wrapped value is never `None`.
+def test_window_order_by_with_multiple_nulls_does_not_crash():
+    tables = {"t": [{"g": 1, "a": None}, {"g": 1, "a": None}, {"g": 1, "a": 5}]}
+
+    asc = execute(
+        "SELECT a, ROW_NUMBER() OVER (PARTITION BY g ORDER BY a) AS rn FROM t",
+        tables=tables,
+        dialect="presto",
+    )
+    asc_by_rn = {row[1]: row[0] for row in asc.rows}
+    assert asc_by_rn[1] == 5
+    assert asc_by_rn[2] is None
+    assert asc_by_rn[3] is None
+
+    desc = execute(
+        "SELECT a, ROW_NUMBER() OVER (PARTITION BY g ORDER BY a DESC) AS rn FROM t",
+        tables=tables,
+        dialect="presto",
+    )
+    desc_by_rn = {row[1]: row[0] for row in desc.rows}
+    assert desc_by_rn[1] is None
+    assert desc_by_rn[2] is None
+    assert desc_by_rn[3] == 5

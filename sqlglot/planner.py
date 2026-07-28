@@ -241,15 +241,32 @@ class Step:
         if where is not None:
             step.condition = where.this
 
-        if windows:
+        group: exp.Group | None = expression.args.get("group")
+
+        # A window function alongside a GROUP BY operates on the query's
+        # *grouped* result set, per standard SQL - never on pre-aggregation
+        # rows - so Aggregate must run before Window here, the reverse of the
+        # windows-but-no-GROUP-BY case below. Building Window first (as if it
+        # always preceded Aggregate) left a window column's own source rows
+        # ungrouped while everything else in the same step's output was
+        # already aggregated - a width/row-count mismatch the executor's
+        # Aggregate step then read right through, raising a bare `KeyError`
+        # on the window column's name (not merely a wrong value) the moment
+        # real, non-empty data reached it. `intermediate`'s rewrite of a
+        # GROUP BY key reference into its aggregate-group alias - already
+        # applied to `projections` and `aggregate.condition` below - is
+        # applied to each window body too, so e.g. `ROW_NUMBER() OVER (ORDER
+        # BY <group-by key expression>)` resolves against the aggregated
+        # output instead of the (no-longer-computed-first) raw rows.
+        defer_windows = bool(windows) and (group is not None or aggregations)
+
+        if windows and not defer_windows:
             window_step = Window()
             window_step.source = step.name
             window_step.name = step.name
             window_step.windows = windows
             window_step.add_dependency(step)
             step = window_step
-
-        group: exp.Group | None = expression.args.get("group")
 
         if group is not None or aggregations:
             aggregate = Aggregate()
@@ -283,6 +300,13 @@ class Step:
                     if name:
                         node.replace(exp.column(name, step.name))
 
+            if defer_windows:
+                for window in windows.values():
+                    for node in window.walk():
+                        name = intermediate.get(node) or intermediate.get(node.name)
+                        if name:
+                            node.replace(exp.column(name, step.name))
+
             if aggregate.condition:
                 for node in aggregate.condition.walk():
                     name = intermediate.get(node) or intermediate.get(node.name)
@@ -291,6 +315,14 @@ class Step:
 
             aggregate.add_dependency(step)
             step = aggregate
+
+            if defer_windows:
+                window_step = Window()
+                window_step.source = step.name
+                window_step.name = step.name
+                window_step.windows = windows
+                window_step.add_dependency(step)
+                step = window_step
         else:
             aggregate = None
 

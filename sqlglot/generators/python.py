@@ -96,12 +96,27 @@ def _div_sql(self: generator.Generator, e: exp.Div) -> str:
     if e.args.get("safe"):
         denominator += " or None"
 
-    sql = f"DIV({self.sql(e, 'this')}, {denominator})"
+    numerator = self.sql(e, "this")
 
-    if e.args.get("typed"):
-        sql = f"int({sql})"
-
-    return sql
+    # `e.args["typed"]` only records that *this dialect's* `/` follows typed-
+    # division rules (Dialect.TYPED_DIVISION) - every division parses with it
+    # set under e.g. Presto/Athena, regardless of operand types. Whether THIS
+    # particular division actually truncates depends on both operands being
+    # integers, exactly like the optimizer's own annotate_types._annotate_div
+    # decides when to give the Div node an integer result type - so mirror
+    # that condition here instead of truncating any DOUBLE/DECIMAL division
+    # to an int just because the dialect flag is set.
+    left_type = e.this.type
+    right_type = e.expression.type
+    typed = (
+        e.args.get("typed")
+        and left_type is not None
+        and left_type.this in exp.DataType.INTEGER_TYPES
+        and right_type is not None
+        and right_type.this in exp.DataType.INTEGER_TYPES
+    )
+    func = "TYPEDDIV" if typed else "DIV"
+    return f"{func}({numerator}, {denominator})"
 
 
 class PythonGenerator(generator.Generator):

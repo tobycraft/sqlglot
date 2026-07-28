@@ -11,7 +11,91 @@ from sqlglot.generator import Generator
 from sqlglot.helper import PYTHON_VERSION, is_int, seq_get
 
 
+_XXH64_P1 = 0x9E3779B185EBCA87
+_XXH64_P2 = 0xC2B2AE3D27D4EB4F
+_XXH64_P3 = 0x165667B19E3779F9
+_XXH64_P4 = 0x85EBCA77C2B2AE63
+_XXH64_P5 = 0x27D4EB2F165667C5
+_XXH64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
+def _xxh64_rotl(x: int, r: int) -> int:
+    return ((x << r) | (x >> (64 - r))) & _XXH64_MASK
+
+
+def xxhash64(data: bytes, seed: int = 0) -> int:
+    """Pure-Python xxHash64 (https://github.com/Cyan4973/xxHash), no third-party dependency."""
+    length = len(data)
+    i = 0
+
+    if length >= 32:
+        v1 = (seed + _XXH64_P1 + _XXH64_P2) & _XXH64_MASK
+        v2 = (seed + _XXH64_P2) & _XXH64_MASK
+        v3 = seed & _XXH64_MASK
+        v4 = (seed - _XXH64_P1) & _XXH64_MASK
+
+        while i <= length - 32:
+            for j in range(4):
+                lane = int.from_bytes(data[i : i + 8], "little")
+                v = (v1, v2, v3, v4)[j]
+                v = (v + lane * _XXH64_P2) & _XXH64_MASK
+                v = _xxh64_rotl(v, 31)
+                v = (v * _XXH64_P1) & _XXH64_MASK
+                v1, v2, v3, v4 = (v if k == j else prev for k, prev in enumerate((v1, v2, v3, v4)))
+                i += 8
+
+        h = (
+            _xxh64_rotl(v1, 1)
+            + _xxh64_rotl(v2, 7)
+            + _xxh64_rotl(v3, 12)
+            + _xxh64_rotl(v4, 18)
+        ) & _XXH64_MASK
+
+        for v in (v1, v2, v3, v4):
+            v = (v * _XXH64_P2) & _XXH64_MASK
+            v = _xxh64_rotl(v, 31)
+            v = (v * _XXH64_P1) & _XXH64_MASK
+            h = ((h ^ v) * _XXH64_P1 + _XXH64_P4) & _XXH64_MASK
+    else:
+        h = (seed + _XXH64_P5) & _XXH64_MASK
+
+    h = (h + length) & _XXH64_MASK
+
+    while i <= length - 8:
+        k1 = int.from_bytes(data[i : i + 8], "little")
+        k1 = (k1 * _XXH64_P2) & _XXH64_MASK
+        k1 = _xxh64_rotl(k1, 31)
+        k1 = (k1 * _XXH64_P1) & _XXH64_MASK
+        h = (_xxh64_rotl(h ^ k1, 27) * _XXH64_P1 + _XXH64_P4) & _XXH64_MASK
+        i += 8
+
+    if i <= length - 4:
+        k1 = int.from_bytes(data[i : i + 4], "little")
+        h = (_xxh64_rotl(h ^ ((k1 * _XXH64_P1) & _XXH64_MASK), 23) * _XXH64_P2 + _XXH64_P3) & _XXH64_MASK
+        i += 4
+
+    while i < length:
+        h = (_xxh64_rotl(h ^ (data[i] * _XXH64_P5), 11) * _XXH64_P1) & _XXH64_MASK
+        i += 1
+
+    h ^= h >> 33
+    h = (h * _XXH64_P2) & _XXH64_MASK
+    h ^= h >> 29
+    h = (h * _XXH64_P3) & _XXH64_MASK
+    h ^= h >> 32
+    return h
+
+
 class reverse_key:
+    """Sort key for a DESC ORDER BY column: reverses the wrapped value's
+    natural ordering. NULLS FIRST for a descending column (matching the
+    common default, e.g. Trino's) - the mirror image of ascending's NULLS
+    LAST - so ``None`` needs its own comparison branch here rather than
+    falling into ``other.obj < self.obj``, which raises the moment either
+    side is ``None`` (`'<' not supported between instances of ... and
+    'NoneType'`), not just when both are.
+    """
+
     def __init__(self, obj):
         self.obj = obj
 
@@ -19,6 +103,10 @@ class reverse_key:
         return other.obj == self.obj
 
     def __lt__(self, other):
+        if self.obj is None:
+            return other.obj is not None
+        if other.obj is None:
+            return False
         return other.obj < self.obj
 
 
@@ -420,6 +508,7 @@ ENV = {
     "ARRAYANY": null_if_any(lambda arr, func: any(func(e) for e in arr)),
     "ARRAYCONTAINS": null_if_any(lambda arr, e: e in arr),
     "ARRAYDISTINCT": null_if_any(lambda arr: list(dict.fromkeys(arr))),
+    "ARRAYFILTER": null_if_any(lambda arr, func: [e for e in arr if func(e)]),
     "ARRAYMIN": null_if_any(min),
     "ARRAYSIZE": null_if_any(lambda arr, *_: len(arr)),
     "ARRAYSORT": null_if_any(lambda arr, *_: sorted(arr)),
@@ -444,9 +533,11 @@ ENV = {
     "TIMESTAMPTRUNC": timestamptrunc,
     "DAYOFWEEKISO": null_if_any(lambda arg: arg.isoweekday()),
     "DIV": null_if_any(lambda e, this: e / this),
+    "TYPEDDIV": null_if_any(lambda e, this: int(e / this)),
     "DOT": null_if_any(lambda e, this: e[this]),
     "DPIPE": null_if_any(lambda this, e: this + e),
     "ENCODE": null_if_any(lambda this, charset="utf-8": this.encode(charset)),
+    "FROM_BIG_ENDIAN_64": null_if_any(lambda this: int.from_bytes(this, "big", signed=True)),
     "EQ": null_if_any(lambda this, e: this == e),
     "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),
     "FLATTEN": null_if_any(lambda arr: [x for sub in arr for x in sub]),
@@ -484,6 +575,7 @@ ENV = {
     "TIMESTRTOTIME": null_if_any(lambda arg: datetime.datetime.fromisoformat(arg)),
     "TRYCAST": try_cast,
     "UPPER": null_if_any(lambda arg: arg.upper()),
+    "XXHASH64": null_if_any(lambda this: xxhash64(this).to_bytes(8, "big")),
     "YEAR": null_if_any(lambda arg: arg.year),
     "MONTH": null_if_any(lambda arg: arg.month),
     "DAY": null_if_any(lambda arg: arg.day),
