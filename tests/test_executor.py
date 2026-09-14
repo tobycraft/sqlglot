@@ -1,5 +1,6 @@
 import csv
 import datetime
+import math
 import unittest
 from datetime import date, time
 from concurrent.futures import ProcessPoolExecutor
@@ -426,7 +427,7 @@ class TestExecutor(unittest.TestCase):
                     (0.5,),
                 ],
             ),
-            ("SELECT 1 / 0 AS a", ["a"], ZeroDivisionError),
+            ("SELECT 1 / 0 AS a", ["a"], [(float("inf"),)]),
             (
                 exp.select(
                     exp.alias_(exp.Literal.number(1).div(exp.Literal.number(2), typed=True), "a")
@@ -1859,3 +1860,50 @@ class TestExecutor(unittest.TestCase):
             with self.subTest(sql):
                 result = execute(sql, schema=schema, tables=tables)
                 self.assertEqual(result.rows, [(expected,)])
+
+    def test_division_by_zero(self):
+        schema = {"t": {"a": "INT", "b": "INT", "c": "DOUBLE", "z": "INT"}}
+        tables = {"t": [{"a": 7, "b": -7, "c": 0.0, "z": 0}]}
+
+        # `/` is IEEE division, so a zero denominator gives an infinity rather
+        # than raising, matching duckdb.
+        for sql, expected in (
+            ("SELECT a / z AS x FROM t", math.inf),
+            ("SELECT b / z AS x FROM t", -math.inf),
+            ("SELECT c / z AS x FROM t", math.nan),
+            ("SELECT z / z AS x FROM t", math.nan),
+            # an integer result has no infinity to return, so these are NULL
+            ("SELECT a % z AS x FROM t", None),
+        ):
+            with self.subTest(sql):
+                value = execute(sql, schema=schema, tables=tables).rows[0][0]
+                if expected is None:
+                    self.assertIsNone(value)
+                elif math.isnan(expected):
+                    self.assertTrue(math.isnan(value))
+                else:
+                    self.assertEqual(value, expected)
+
+        self.assertIsNone(
+            execute(
+                "SELECT a // z AS x FROM t", schema=schema, tables=tables, dialect="duckdb"
+            ).rows[0][0]
+        )
+        # typed division is generated as INT(DIV(...)); the infinity has no
+        # integer form, so it comes back NULL like duckdb's `//`
+        self.assertIsNone(
+            execute(
+                "SELECT a / z AS x FROM t", schema=schema, tables=tables, dialect="postgres"
+            ).rows[0][0]
+        )
+        # an explicitly safe division keeps returning NULL
+        safe = exp.select(
+            exp.alias_(exp.Div(this=exp.column("a"), expression=exp.column("z"), safe=True), "x")
+        ).from_("t")
+        self.assertIsNone(execute(safe, schema=schema, tables=tables).rows[0][0])
+
+        # a NULL operand still wins over the zero denominator
+        nulls = {"t": [{"a": None, "b": None, "c": None, "z": 0}]}
+        for sql in ("SELECT a / z AS x FROM t", "SELECT a % z AS x FROM t"):
+            with self.subTest(f"null: {sql}"):
+                self.assertIsNone(execute(sql, schema=schema, tables=nulls).rows[0][0])

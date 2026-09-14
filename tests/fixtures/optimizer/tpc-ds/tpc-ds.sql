@@ -12523,7 +12523,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 90
 --------------------------------------
--- not executed: divides by zero on this data; duckdb returns inf per IEEE, Python raises
+# execute: true
 SELECT Cast(amc AS DECIMAL(15, 4)) / Cast(pmc AS DECIMAL(15, 4))
                am_pm_ratio
 FROM   (SELECT Count(*) amc

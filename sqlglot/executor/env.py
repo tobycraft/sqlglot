@@ -1,5 +1,6 @@
 import datetime
 import inspect
+import math
 import re
 import statistics
 from functools import wraps
@@ -252,6 +253,45 @@ def jsonextract(this, expression):
     return this
 
 
+@null_if_any
+def div(this, expression):
+    """SQL `/`, which is IEEE division: a zero denominator gives an infinity.
+
+    Python raises instead, so the zero case is spelled out. This follows
+    duckdb, the engine these results are checked against; note that dialects
+    disagree here - Postgres raises, MySQL and Spark return NULL - and the
+    executor has no dialect knob to tell them apart.
+    """
+    if expression == 0:
+        if this == 0:
+            return math.nan
+        return math.inf if this > 0 else -math.inf
+
+    return this / expression
+
+
+@null_if_any
+def intdiv(this, expression):
+    # Integer division can't represent an infinity, so duckdb yields NULL.
+    return None if expression == 0 else this // expression
+
+
+@null_if_any
+def mod(this, expression):
+    return None if expression == 0 else this % expression
+
+
+@null_if_any
+def to_int(this):
+    # Typed division is generated as INT(DIV(...)), so a zero denominator
+    # arrives here as an infinity - which has no integer form. duckdb returns
+    # NULL for integer division by zero, so do the same.
+    if isinstance(this, float) and not math.isfinite(this):
+        return None
+
+    return int(this)
+
+
 ENV = {
     "exp": exp,
     "AND": sql_and,
@@ -283,7 +323,7 @@ ENV = {
     "CONCATWS": null_if_any(lambda this, *args: this.join(args)),
     "DATEDIFF": null_if_any(lambda this, expression, *_: (this - expression).days),
     "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
-    "DIV": null_if_any(lambda e, this: e / this),
+    "DIV": div,
     "DOT": null_if_any(lambda e, this: e[this]),
     "EQ": null_if_any(lambda this, e: this == e),
     "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),
@@ -291,8 +331,8 @@ ENV = {
     "GTE": null_if_any(lambda this, e: this >= e),
     "IF": lambda predicate, true, false: true if predicate else false,
     "IN": sql_in,
-    "INT": null_if_any(int),
-    "INTDIV": null_if_any(lambda e, this: e // this),
+    "INT": to_int,
+    "INTDIV": intdiv,
     "INTERVAL": interval,
     "JSONEXTRACT": jsonextract,
     "LEFT": null_if_any(lambda this, e: this[:e]),
@@ -303,7 +343,7 @@ ENV = {
     "LT": null_if_any(lambda this, e: this < e),
     "LTE": null_if_any(lambda this, e: this <= e),
     "MAP": null_if_any(lambda *args: dict(zip(*args))),  # type: ignore
-    "MOD": null_if_any(lambda e, this: e % this),
+    "MOD": mod,
     "MUL": null_if_any(lambda e, this: e * this),
     "NEQ": null_if_any(lambda this, e: this != e),
     "ORD": null_if_any(ord),
