@@ -1758,6 +1758,24 @@ class TestExecutor(unittest.TestCase):
                 "SELECT a, GROUPING(a) AS g, SUM(v) AS s FROM t GROUP BY ROLLUP(a)",
                 [(None, 1, 15), ("x", 0, 3), ("y", 0, 12)],
             ),
+            # the trailing forms: WITH ROLLUP/CUBE carry no keys of their own
+            # and stand in for the list before them
+            (
+                "SELECT a, b, SUM(v) AS s FROM t GROUP BY a, b WITH ROLLUP",
+                [
+                    (None, None, 15),
+                    ("x", None, 3),
+                    ("x", "p", 1),
+                    ("x", "q", 2),
+                    ("y", None, 12),
+                    ("y", "p", 4),
+                    ("y", "q", 8),
+                ],
+            ),
+            (
+                "SELECT a, SUM(v) AS s FROM t GROUP BY a GROUPING SETS ((a), ())",
+                [(None, 15), ("x", 3), ("y", 12)],
+            ),
             # plain keys belong to every set produced by the ROLLUP
             (
                 "SELECT a, b, SUM(v) AS s FROM t GROUP BY a, ROLLUP(b)",

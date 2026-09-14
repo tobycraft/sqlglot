@@ -11,6 +11,33 @@ from sqlglot.optimizer.scope import find_all_in_scope, find_in_scope
 from collections.abc import Iterator, Sequence, Iterable
 
 
+def _grouping_set_keys(construct: exp.Expr) -> list[list[exp.Expr]]:
+    """The key lists one ROLLUP / CUBE / GROUPING SETS construct stands for."""
+    if isinstance(construct, exp.Rollup):
+        keys = construct.expressions
+        return [keys[:i] for i in range(len(keys), -1, -1)]
+
+    if isinstance(construct, exp.Cube):
+        keys = construct.expressions
+        return [
+            list(combo)
+            for size in range(len(keys), -1, -1)
+            for combo in itertools.combinations(keys, size)
+        ]
+
+    sets = []
+
+    for entry in construct.expressions:
+        if isinstance(entry, (exp.Tuple, exp.Array)):
+            sets.append(list(entry.expressions))
+        elif isinstance(entry, exp.Paren):
+            sets.append([entry.this])
+        else:
+            sets.append([entry])
+
+    return sets
+
+
 def _expand_grouping_sets(group: exp.Group) -> list[list[exp.Expr]] | None:
     """
     Expands ROLLUP / CUBE / GROUPING SETS into the explicit key lists they stand for.
@@ -20,42 +47,37 @@ def _expand_grouping_sets(group: exp.Group) -> list[list[exp.Expr]] | None:
     multiply out, per standard SQL, and plain keys belong to every set.
     """
     plain: list[exp.Expr] = []
-    factors: list[list[list[exp.Expr]]] = []
+    constructs: list[exp.Expr] = []
 
     for key in group.expressions:
-        if isinstance(key, exp.Rollup):
-            keys = key.expressions
-            factors.append([keys[:i] for i in range(len(keys), -1, -1)])
-        elif isinstance(key, exp.Cube):
-            keys = key.expressions
-            factors.append(
-                [
-                    list(combo)
-                    for size in range(len(keys), -1, -1)
-                    for combo in itertools.combinations(keys, size)
-                ]
-            )
-        elif isinstance(key, exp.GroupingSets):
-            sets = []
-
-            for entry in key.expressions:
-                if isinstance(entry, (exp.Tuple, exp.Array)):
-                    sets.append(list(entry.expressions))
-                elif isinstance(entry, exp.Paren):
-                    sets.append([entry.this])
-                else:
-                    sets.append([entry])
-
-            factors.append(sets)
+        if isinstance(key, (exp.Rollup, exp.Cube, exp.GroupingSets)):
+            constructs.append(key)
         else:
             plain.append(key)
 
-    if not factors:
+    # The trailing forms - `GROUP BY a, b WITH ROLLUP`, and Hive's `GROUP BY a, b
+    # GROUPING SETS (...)` - parse into their own args and describe the keys
+    # listed before them, which they stand in for rather than combine with. A
+    # trailing WITH ROLLUP/CUBE carries no keys of its own at all.
+    trailing = [
+        key for arg in ("rollup", "cube", "grouping_sets") for key in (group.args.get(arg) or [])
+    ]
+
+    if trailing:
+        for key in trailing:
+            if isinstance(key, (exp.Rollup, exp.Cube)) and not key.expressions:
+                key = key.__class__(expressions=list(plain))
+            constructs.append(key)
+
+        plain = []
+
+    if not constructs:
         return None
 
     combinations = [plain]
 
-    for factor in factors:
+    for construct in constructs:
+        factor = _grouping_set_keys(construct)
         combinations = [keys + extra for keys in combinations for extra in factor]
 
     return combinations
