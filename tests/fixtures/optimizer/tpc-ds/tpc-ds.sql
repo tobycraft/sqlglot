@@ -596,6 +596,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 5
 --------------------------------------
+# execute: true
 WITH ssr AS
 (
          SELECT   s_store_id,
@@ -995,6 +996,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 8
 --------------------------------------
+# execute: true
 SELECT s_store_name,
                Sum(ss_net_profit)
 FROM   store_sales,
@@ -2230,6 +2232,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 12
 --------------------------------------
+# execute: true
 SELECT
          i_item_id ,
          i_item_desc ,
@@ -2292,6 +2295,8 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 13
 --------------------------------------
+-- not executed: its join keys for customer_demographics sit inside an OR, so it plans a
+-- CROSS JOIN of two 10k-row tables - too large for the Python engine
 SELECT Avg(ss_quantity),
        Avg(ss_ext_sales_price),
        Avg(ss_ext_wholesale_cost),
@@ -2401,6 +2406,7 @@ JOIN "store" AS "store"
 --------------------------------------
 -- TPC-DS 14
 --------------------------------------
+# execute: true
 WITH cross_items
      AS (SELECT i_item_sk ss_item_sk
          FROM   item,
@@ -2773,6 +2779,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 16
 --------------------------------------
+# execute: true
 SELECT
          Count(DISTINCT cs_order_number) AS "order count" ,
          Sum(cs_ext_ship_cost)           AS "total shipping cost" ,
@@ -2963,6 +2970,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 18
 --------------------------------------
+# execute: true
 SELECT i_item_id,
                ca_country,
                ca_state,
@@ -3114,6 +3122,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 20
 --------------------------------------
+# execute: true
 SELECT
          i_item_id ,
          i_item_desc ,
@@ -3176,6 +3185,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 21
 --------------------------------------
+# execute: true
 SELECT
          *
 FROM    (
@@ -3263,6 +3273,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 22
 --------------------------------------
+# execute: true
 SELECT i_product_name,
                i_brand,
                i_class,
@@ -3721,6 +3732,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 27
 --------------------------------------
+# execute: true
 SELECT i_item_id,
                s_state,
                Grouping(s_state)   g_state,
@@ -3782,6 +3794,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 28
 --------------------------------------
+# execute: true
 SELECT *
 FROM   (SELECT Avg(ss_list_price)            b1_lp,
                Count(ss_list_price)          b1_cnt,
@@ -4052,6 +4065,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 30
 --------------------------------------
+# execute: true
 WITH customer_total_return
      AS (SELECT wr_returning_customer_sk AS ctr_customer_sk,
                 ca_state                 AS ctr_state,
@@ -4334,6 +4348,7 @@ ORDER BY
 --------------------------------------
 -- TPC-DS 32
 --------------------------------------
+# execute: true
 SELECT
        Sum(cs_ext_discount_amt) AS "excess discount amount"
 FROM   catalog_sales ,
@@ -4850,6 +4865,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 36
 --------------------------------------
+# execute: true
 SELECT Sum(ss_net_profit) / Sum(ss_ext_sales_price)                 AS
                gross_margin,
                i_category,
@@ -4911,6 +4927,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 37
 --------------------------------------
+# execute: true
 SELECT
          i_item_id ,
          i_item_desc ,
@@ -5047,6 +5064,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 39
 --------------------------------------
+# execute: true
 WITH inv
      AS (SELECT w_warehouse_name,
                 w_warehouse_sk,
@@ -5165,6 +5183,7 @@ ORDER BY
 --------------------------------------
 -- TPC-DS 40
 --------------------------------------
+# execute: true
 SELECT
                 w_state ,
                 i_item_id ,
@@ -5241,6 +5260,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 41
 --------------------------------------
+# execute: true
 SELECT Distinct(i_product_name)
 FROM   item i1
 WHERE  i_manufact_id BETWEEN 765 AND 765 + 40
@@ -5606,6 +5626,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 44
 --------------------------------------
+# execute: true
 SELECT asceding.rnk,
                i1.i_product_name best_performing,
                i2.i_product_name worst_performing
@@ -5885,6 +5906,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 47
 --------------------------------------
+# execute: true
 WITH v1
      AS (SELECT i_category,
                 i_brand,
@@ -6130,6 +6152,7 @@ JOIN "store" AS "store"
 --------------------------------------
 -- TPC-DS 49
 --------------------------------------
+# execute: true
 SELECT 'web' AS channel,
                web.item,
                web.return_ratio,
@@ -6544,6 +6567,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 51
 --------------------------------------
+# execute: true
 WITH web_v1 AS
 (
          SELECT   ws_item_sk item_sk,
@@ -6734,6 +6758,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 53
 --------------------------------------
+# execute: true
 SELECT *
 FROM   (SELECT i_manufact_id,
                Sum(ss_sales_price)             sum_sales,
@@ -7220,6 +7245,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 57
 --------------------------------------
+# execute: true
 WITH v1
      AS (SELECT i_category,
                 i_brand,
@@ -7363,6 +7389,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 58
 --------------------------------------
+# execute: true
 WITH ss_items
      AS (SELECT i_item_id               item_id,
                 Sum(ss_ext_sales_price) ss_item_rev
@@ -7930,6 +7957,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 61
 --------------------------------------
+# execute: true
 SELECT promotions,
                total,
                Cast(promotions AS DECIMAL(15, 4)) /
@@ -8171,6 +8199,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 63
 --------------------------------------
+# execute: true
 SELECT *
 FROM   (SELECT i_manager_id,
                Sum(ss_sales_price)            sum_sales,
@@ -8304,6 +8333,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 64
 --------------------------------------
+# execute: true
 WITH cs_ui
      AS (SELECT cs_item_sk,
                 Sum(cs_ext_list_price) AS sale,
@@ -9446,6 +9476,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 67
 --------------------------------------
+# execute: true
 select *
 from (select i_category
             ,i_class
@@ -9802,6 +9833,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 70
 --------------------------------------
+# execute: true
 SELECT Sum(ss_net_profit)                     AS total_sum,
                s_state,
                s_county,
@@ -10012,6 +10044,8 @@ ORDER BY
 --------------------------------------
 -- TPC-DS 72
 --------------------------------------
+-- not executed: duckdb rejects the reference query itself ('+(VARCHAR, INTERVAL)'), so there
+-- is nothing to check the engine against
 SELECT i_item_desc,
                w_warehouse_name,
                d1.d_week_seq,
@@ -10706,6 +10740,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 77
 --------------------------------------
+# execute: true
 WITH ss AS
 (
          SELECT   s_store_sk,
@@ -11215,6 +11250,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 80
 --------------------------------------
+# execute: true
 WITH ssr AS
 (
                 SELECT          s_store_id                                    AS store_id,
@@ -11572,6 +11608,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 82
 --------------------------------------
+# execute: true
 SELECT
          i_item_id ,
          i_item_desc ,
@@ -11999,6 +12036,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 86
 --------------------------------------
+# execute: true
 SELECT Sum(ws_net_paid)                         AS total_sum,
                i_category,
                i_class,
@@ -12374,6 +12412,7 @@ CROSS JOIN "s8" AS "s8";
 --------------------------------------
 -- TPC-DS 89
 --------------------------------------
+# execute: true
 SELECT  *
 FROM  (SELECT i_category,
               i_class,
@@ -12484,6 +12523,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 90
 --------------------------------------
+-- not executed: divides by zero on this data; duckdb returns inf per IEEE, Python raises
 SELECT Cast(amc AS DECIMAL(15, 4)) / Cast(pmc AS DECIMAL(15, 4))
                am_pm_ratio
 FROM   (SELECT Count(*) amc
@@ -12648,6 +12688,7 @@ ORDER BY
 --------------------------------------
 -- TPC-DS 92
 --------------------------------------
+# execute: true
 SELECT
          Sum(ws_ext_discount_amt) AS "Excess Discount Amount"
 FROM     web_sales ,
@@ -12764,6 +12805,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 94
 --------------------------------------
+# execute: true
 SELECT
          Count(DISTINCT ws_order_number) AS "order count" ,
          Sum(ws_ext_ship_cost)           AS "total shipping cost" ,
@@ -12838,6 +12880,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 95
 --------------------------------------
+# execute: true
 WITH ws_wh AS
 (
        SELECT ws1.ws_order_number,
@@ -13059,6 +13102,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-DS 98
 --------------------------------------
+# execute: true
 SELECT i_item_id,
        i_item_desc,
        i_category,
