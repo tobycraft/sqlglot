@@ -1800,3 +1800,21 @@ class TestExecutor(unittest.TestCase):
             with self.subTest(sql):
                 result = execute(sql, schema=schema, tables={"t": rows})
                 self.assertEqual(sorted(result.rows, key=str), sorted(expected, key=str))
+
+    def test_parameterized_cast(self):
+        schema = {"t": {"v": "DOUBLE"}}
+        tables = {"t": [{"v": 5.4321}]}
+
+        for sql, expected in (
+            # rendering the whole DataType would emit exp.DType.DECIMAL(15, 4),
+            # which calls the enum member
+            ("SELECT CAST(v AS DECIMAL(15, 4)) AS x FROM t", 5.4321),
+            ("SELECT CAST(v AS DECIMAL(15, 2)) AS x FROM t", 5.43),
+            # DECIMAL keeps its fractional part rather than going through int()
+            ("SELECT CAST(v AS DECIMAL) AS x FROM t", 5.4321),
+            ("SELECT CAST(v AS INT) AS x FROM t", 5),
+            ("SELECT CAST(v AS VARCHAR) AS x FROM t", "5.4321"),
+        ):
+            with self.subTest(sql):
+                result = execute(sql, schema=schema, tables=tables)
+                self.assertEqual(result.rows, [(expected,)])

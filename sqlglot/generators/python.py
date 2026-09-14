@@ -90,6 +90,15 @@ def _dpipe_sql(self: generator.Generator, e: exp.DPipe) -> str:
     return self.func("SAFECONCAT" if e.args.get("safe") else "CONCAT", e.this, e.expression)
 
 
+def _cast_sql(self, e: exp.Cast) -> str:
+    # Rendering the whole DataType inlines its parameters as a call -
+    # `exp.DType.DECIMAL(15, 4)` - which tries to call the enum member. Name the
+    # type alone and hand the parameters to CAST as arguments.
+    to = e.args["to"]
+    params = "".join(f", {self.sql(p)}" for p in to.expressions)
+    return f"CAST({self.sql(e.this)}, exp.DType.{to.this.value}{params})"
+
+
 def _distinct_sql(self, e: exp.Distinct) -> str:
     # Inside an aggregate the wrapped expression evaluates to the group's whole
     # vector of values, so deduping it here is what DISTINCT actually means.
@@ -109,7 +118,7 @@ class PythonGenerator(generator.Generator):
         exp.And: lambda self, e: f"AND(lambda: {self.sql(e.left)}, lambda: {self.sql(e.right)})",
         exp.Between: _rename,
         exp.Boolean: lambda self, e: "True" if e.this else "False",
-        exp.Cast: lambda self, e: f"CAST({self.sql(e.this)}, exp.DType.{e.args['to']})",
+        exp.Cast: _cast_sql,
         exp.Column: lambda self, e: f"scope[{self.sql(e, 'table') or None}][{self.sql(e.this)}]",
         exp.Concat: lambda self, e: self.func(
             "SAFECONCAT" if e.args.get("safe") else "CONCAT", *e.expressions

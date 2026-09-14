@@ -145,8 +145,22 @@ def substring(this, start=None, length=None):
     return this[start:end]
 
 
+DECIMAL_TYPES = {
+    exp.DType.DECIMAL,
+    exp.DType.DECIMAL32,
+    exp.DType.DECIMAL64,
+    exp.DType.DECIMAL128,
+    exp.DType.DECIMAL256,
+    exp.DType.BIGDECIMAL,
+    exp.DType.UDECIMAL,
+    exp.DType.MONEY,
+    exp.DType.SMALLMONEY,
+    exp.DType.DECFLOAT,
+}
+
+
 @null_if_any
-def cast(this, to):
+def cast(this, to, *params):
     if to == exp.DType.DATE:
         if isinstance(this, datetime.datetime):
             return this.date()
@@ -172,8 +186,13 @@ def cast(this, to):
         return bool(this)
     if to in exp.DataType.TEXT_TYPES:
         return str(this)
-    if to in {exp.DType.FLOAT, exp.DType.DOUBLE}:
-        return float(this)
+    # DECIMAL carries a fractional part, so it can't go through the integer
+    # branch below; the scale, when given, is the second parameter.
+    if to in {exp.DType.FLOAT, exp.DType.DOUBLE} | DECIMAL_TYPES:
+        this = float(this)
+        if params:
+            this = round(this, int(params[-1]))
+        return this
     if to in exp.DataType.NUMERIC_TYPES:
         return int(this)
     raise NotImplementedError(f"Casting {this} to '{to}' not implemented.")
