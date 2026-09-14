@@ -1689,3 +1689,26 @@ class TestExecutor(unittest.TestCase):
             with self.subTest(sql):
                 result = execute(sql, schema=schema, tables={"t": rows})
                 self.assertEqual(sorted(result.rows), sorted(expected))
+
+    def test_order_by_set_operation(self):
+        schema = {"t": {"i": "INT"}}
+        rows = [{"i": 2}, {"i": 1}]
+
+        # The Sort step has no projections of its own here - it must pass the
+        # set operation's columns through rather than slice them away.
+        result = execute(
+            "SELECT 'a' AS c, i FROM t UNION ALL SELECT 'b' AS c, i FROM t ORDER BY c, i",
+            schema=schema,
+            tables={"t": rows},
+        )
+        self.assertEqual(result.columns, ("c", "i"))
+        self.assertEqual(result.rows, [("a", 1), ("a", 2), ("b", 1), ("b", 2)])
+
+        empty = execute(
+            "SELECT 'a' AS c, i FROM t WHERE i > 9 UNION ALL SELECT 'b' AS c, i FROM t"
+            " WHERE i > 9 ORDER BY c",
+            schema=schema,
+            tables={"t": rows},
+        )
+        self.assertEqual(empty.columns, ("c", "i"))
+        self.assertEqual(empty.rows, [])

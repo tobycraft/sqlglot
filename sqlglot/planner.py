@@ -444,6 +444,15 @@ class SetOperation(Step):
         left.name = left.name or "left"
         right = Step.from_expression(expression.right, ctes)
         right.name = right.name or "right"
+
+        if left.name == right.name:
+            # Both branches reading the same table (`SELECT .. FROM t UNION ALL
+            # SELECT .. FROM t`) would otherwise publish their outputs under one
+            # name. The executor resolves a branch by name, so it read the same
+            # side twice and returned that branch's rows for both.
+            left.name = f"{left.name}_1"
+            right.name = f"{right.name}_2"
+
         step = cls(
             op=expression.__class__,
             left=left.name,
