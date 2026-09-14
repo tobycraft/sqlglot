@@ -420,8 +420,6 @@ class PythonExecutor:
                     table.append(source_nulls + row)
 
     def aggregate(self, step, context):
-        group_by = self.generate_tuple(step.group.values())
-        aggregations = self.generate_tuple(step.aggregations)
         operands = self.generate_tuple(step.operands)
 
         if operands:
@@ -449,16 +447,44 @@ class PythonExecutor:
                 }
             )
 
+        group_names = list(step.group)
+        table = self.table(group_names + step.aggregations)
+
+        # A plain GROUP BY is just the single grouping set of all its keys.
+        for keys in step.grouping_sets or [group_names]:
+            self._aggregate_grouping_set(step, context, keys, group_names, table)
+
+        context = self.context({step.name: table, **{name: table for name in context.tables}})
+
+        if step.projections or step.condition:
+            return self.context(
+                {step.name: self._project_and_filter(context, step, context.table_iter(step.name))}
+            )
+        return context
+
+    def _aggregate_grouping_set(self, step, context, keys, group_names, table):
+        """Aggregate by `keys` alone, appending the resulting rows to `table`.
+
+        Keys the set leaves out are reported as NULL, per ROLLUP/CUBE/GROUPING
+        SETS semantics - which is also what makes GROUPING() meaningful.
+        """
+        group_by = self.generate_tuple([step.group[key] for key in keys])
+        aggregations = self.generate_tuple(
+            [self._resolve_grouping(step, expression, keys) for expression in step.aggregations]
+        )
+        # Where each output key column reads from this set's key tuple.
+        positions = [keys.index(name) if name in keys else None for name in group_names]
+
         context.sort(group_by)
 
         group = None
         start = 0
         end = 1
         length = len(context.table)
-        table = self.table(list(step.group) + step.aggregations)
 
         def add_row():
-            table.append(group + context.eval_tuple(aggregations))
+            row = tuple(None if pos is None else group[pos] for pos in positions)
+            table.append(row + context.eval_tuple(aggregations))
 
         if length:
             for i in range(length):
@@ -478,15 +504,29 @@ class PythonExecutor:
                     add_row()
         elif step.limit > 0 and not group_by:
             context.set_range(0, 0)
-            table.append(context.eval_tuple(aggregations))
+            group = ()
+            add_row()
 
-        context = self.context({step.name: table, **{name: table for name in context.tables}})
+    def _resolve_grouping(self, step, expression, keys):
+        """Fold `GROUPING(<key>)` to a constant for the grouping set `keys`.
 
-        if step.projections or step.condition:
-            return self.context(
-                {step.name: self._project_and_filter(context, step, context.table_iter(step.name))}
-            )
-        return context
+        GROUPING reports whether a key was aggregated away, which is fixed for
+        a whole set, so it resolves here rather than per row. Multiple
+        arguments give a bitmask, leftmost argument most significant.
+        """
+        if not expression.find(exp.Grouping):
+            return expression
+
+        names = {e.sql(): name for name, e in step.group.items()}
+        expression = expression.copy()
+
+        for node in list(expression.find_all(exp.Grouping)):
+            bits = 0
+            for arg in node.expressions:
+                bits = (bits << 1) | (names.get(arg.sql()) not in keys)
+            node.replace(exp.Literal.number(bits))
+
+        return expression
 
     def sort(self, step, context):
         projections = self.generate_tuple(step.projections)

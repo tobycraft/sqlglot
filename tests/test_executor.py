@@ -1712,3 +1712,47 @@ class TestExecutor(unittest.TestCase):
         )
         self.assertEqual(empty.columns, ("c", "i"))
         self.assertEqual(empty.rows, [])
+
+    def test_grouping_sets(self):
+        rows = [
+            {"a": "x", "b": "p", "v": 1},
+            {"a": "x", "b": "q", "v": 2},
+            {"a": "y", "b": "p", "v": 4},
+            {"a": "y", "b": "q", "v": 8},
+        ]
+        schema = {"t": {"a": "VARCHAR", "b": "VARCHAR", "v": "INT"}}
+
+        for sql, expected in (
+            (
+                "SELECT a, b, SUM(v) AS s FROM t GROUP BY ROLLUP(a, b)",
+                [(None, None, 15), ("x", None, 3), ("x", "p", 1), ("x", "q", 2),
+                 ("y", None, 12), ("y", "p", 4), ("y", "q", 8)],
+            ),  # fmt: skip
+            (
+                "SELECT a, b, SUM(v) AS s FROM t GROUP BY CUBE(a, b)",
+                [(None, None, 15), (None, "p", 5), (None, "q", 10), ("x", None, 3),
+                 ("x", "p", 1), ("x", "q", 2), ("y", None, 12), ("y", "p", 4),
+                 ("y", "q", 8)],
+            ),  # fmt: skip
+            (
+                "SELECT a, SUM(v) AS s FROM t GROUP BY GROUPING SETS ((a), ())",
+                [(None, 15), ("x", 3), ("y", 12)],
+            ),
+            # GROUPING reports which keys a row was aggregated over
+            (
+                "SELECT a, GROUPING(a) AS g, SUM(v) AS s FROM t GROUP BY ROLLUP(a)",
+                [(None, 1, 15), ("x", 0, 3), ("y", 0, 12)],
+            ),
+            # plain keys belong to every set produced by the ROLLUP
+            (
+                "SELECT a, b, SUM(v) AS s FROM t GROUP BY a, ROLLUP(b)",
+                [("x", None, 3), ("x", "p", 1), ("x", "q", 2), ("y", None, 12),
+                 ("y", "p", 4), ("y", "q", 8)],
+            ),  # fmt: skip
+        ):
+            with self.subTest(sql):
+                result = execute(sql, schema=schema, tables={"t": rows})
+                self.assertEqual(
+                    sorted(result.rows, key=lambda r: tuple("" if v is None else str(v) for v in r)),
+                    sorted(expected, key=lambda r: tuple("" if v is None else str(v) for v in r)),
+                )

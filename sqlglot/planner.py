@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 import typing as t
 
@@ -8,6 +9,56 @@ from sqlglot.helper import name_sequence
 from sqlglot.optimizer.eliminate_joins import join_condition
 from sqlglot.optimizer.scope import find_all_in_scope, find_in_scope
 from collections.abc import Iterator, Sequence, Iterable
+
+
+def _expand_grouping_sets(group: exp.Group) -> list[list[exp.Expr]] | None:
+    """
+    Expands ROLLUP / CUBE / GROUPING SETS into the explicit key lists they stand for.
+
+    Returns `None` when the GROUP BY is a plain key list, which the executor
+    aggregates in a single pass. Several such constructs in one GROUP BY
+    multiply out, per standard SQL, and plain keys belong to every set.
+    """
+    plain: list[exp.Expr] = []
+    factors: list[list[list[exp.Expr]]] = []
+
+    for key in group.expressions:
+        if isinstance(key, exp.Rollup):
+            keys = key.expressions
+            factors.append([keys[:i] for i in range(len(keys), -1, -1)])
+        elif isinstance(key, exp.Cube):
+            keys = key.expressions
+            factors.append(
+                [
+                    list(combo)
+                    for size in range(len(keys), -1, -1)
+                    for combo in itertools.combinations(keys, size)
+                ]
+            )
+        elif isinstance(key, exp.GroupingSets):
+            sets = []
+
+            for entry in key.expressions:
+                if isinstance(entry, (exp.Tuple, exp.Array)):
+                    sets.append(list(entry.expressions))
+                elif isinstance(entry, exp.Paren):
+                    sets.append([entry.this])
+                else:
+                    sets.append([entry])
+
+            factors.append(sets)
+        else:
+            plain.append(key)
+
+    if not factors:
+        return None
+
+    combinations = [plain]
+
+    for factor in factors:
+        combinations = [keys + extra for keys in combinations for extra in factor]
+
+    return combinations
 
 
 class Plan:
@@ -187,9 +238,26 @@ class Step:
             set_ops_and_aggs(aggregate)
 
             # give aggregates names and replace projections with references to them
-            aggregate.group = {
-                f"_g{i}": e for i, e in enumerate(group.expressions if group else [])
-            }
+            grouping_sets = _expand_grouping_sets(group) if group else None
+
+            if grouping_sets is None:
+                keys = list(group.expressions) if group else []
+            else:
+                # Every key any set mentions has to be computed; each set then
+                # aggregates by the subset it actually names.
+                keys = []
+                for grouping_set in grouping_sets:
+                    for key in grouping_set:
+                        if not any(key == existing for existing in keys):
+                            keys.append(key)
+
+            aggregate.group = {f"_g{i}": e for i, e in enumerate(keys)}
+
+            if grouping_sets is not None:
+                names = {e: name for name, e in aggregate.group.items()}
+                aggregate.grouping_sets = [
+                    [names[key] for key in grouping_set] for grouping_set in grouping_sets
+                ]
 
             intermediate: dict[str | exp.Expr, str] = {}
             for k, v in aggregate.group.items():
@@ -388,6 +456,10 @@ class Aggregate(Step):
         self.aggregations: list[exp.Expr] = []
         self.operands: tuple[exp.Expr, ...] = ()
         self.group: dict[str, exp.Expr] = {}
+        # One entry per GROUP BY grouping set, each listing the `group` keys
+        # that set aggregates by; keys a set leaves out come back as NULL.
+        # Empty when the query groups by a plain key list.
+        self.grouping_sets: list[list[str]] = []
         self.source: str | None = None
 
     def _to_s(self, indent: str) -> list[str]:
@@ -400,6 +472,11 @@ class Aggregate(Step):
             lines.append(f"{indent}Group:")
             for expression in self.group.values():
                 lines.append(f"{indent}  - {expression.sql()}")
+        if self.grouping_sets:
+            lines.append(f"{indent}Grouping Sets:")
+            for keys in self.grouping_sets:
+                rendered = ", ".join(self.group[key].sql() for key in keys)
+                lines.append(f"{indent}  - ({rendered})")
         if self.condition:
             lines.append(f"{indent}Having:")
             lines.append(f"{indent}  - {self.condition.sql()}")
