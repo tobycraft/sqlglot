@@ -1725,14 +1725,29 @@ class TestExecutor(unittest.TestCase):
         for sql, expected in (
             (
                 "SELECT a, b, SUM(v) AS s FROM t GROUP BY ROLLUP(a, b)",
-                [(None, None, 15), ("x", None, 3), ("x", "p", 1), ("x", "q", 2),
-                 ("y", None, 12), ("y", "p", 4), ("y", "q", 8)],
+                [
+                    (None, None, 15),
+                    ("x", None, 3),
+                    ("x", "p", 1),
+                    ("x", "q", 2),
+                    ("y", None, 12),
+                    ("y", "p", 4),
+                    ("y", "q", 8),
+                ],
             ),  # fmt: skip
             (
                 "SELECT a, b, SUM(v) AS s FROM t GROUP BY CUBE(a, b)",
-                [(None, None, 15), (None, "p", 5), (None, "q", 10), ("x", None, 3),
-                 ("x", "p", 1), ("x", "q", 2), ("y", None, 12), ("y", "p", 4),
-                 ("y", "q", 8)],
+                [
+                    (None, None, 15),
+                    (None, "p", 5),
+                    (None, "q", 10),
+                    ("x", None, 3),
+                    ("x", "p", 1),
+                    ("x", "q", 2),
+                    ("y", None, 12),
+                    ("y", "p", 4),
+                    ("y", "q", 8),
+                ],
             ),  # fmt: skip
             (
                 "SELECT a, SUM(v) AS s FROM t GROUP BY GROUPING SETS ((a), ())",
@@ -1746,14 +1761,22 @@ class TestExecutor(unittest.TestCase):
             # plain keys belong to every set produced by the ROLLUP
             (
                 "SELECT a, b, SUM(v) AS s FROM t GROUP BY a, ROLLUP(b)",
-                [("x", None, 3), ("x", "p", 1), ("x", "q", 2), ("y", None, 12),
-                 ("y", "p", 4), ("y", "q", 8)],
+                [
+                    ("x", None, 3),
+                    ("x", "p", 1),
+                    ("x", "q", 2),
+                    ("y", None, 12),
+                    ("y", "p", 4),
+                    ("y", "q", 8),
+                ],
             ),  # fmt: skip
         ):
             with self.subTest(sql):
                 result = execute(sql, schema=schema, tables={"t": rows})
                 self.assertEqual(
-                    sorted(result.rows, key=lambda r: tuple("" if v is None else str(v) for v in r)),
+                    sorted(
+                        result.rows, key=lambda r: tuple("" if v is None else str(v) for v in r)
+                    ),
                     sorted(expected, key=lambda r: tuple("" if v is None else str(v) for v in r)),
                 )
 
