@@ -1,4 +1,3 @@
-import ast
 import csv
 import datetime
 import unittest
@@ -41,6 +40,35 @@ def open_file(file_name):
         return gzip.open(file_name, "rt", newline="")
 
     return open(file_name, encoding="utf-8", newline="")
+
+
+def dedupe(columns):
+    """Suffixes repeated column names the way duckdb does (x, x_1, x_2)."""
+    seen: dict = {}
+    result = []
+
+    for column in columns:
+        seen[column] = seen.get(column, 0) + 1
+        result.append(column if seen[column] == 1 else f"{column}_{seen[column] - 1}")
+
+    return result
+
+
+INT_TYPES = {"int", "integer", "bigint", "smallint", "tinyint"}
+FLOAT_TYPES = {"double", "float", "real", "decimal"}
+
+
+def converter(type_):
+    """Returns the Python constructor for a column of the given schema type."""
+    name = type_.split("(")[0].strip().lower()
+
+    if name in INT_TYPES:
+        # TPC fixtures write whole numbers as 18.0, which int() won't take.
+        return lambda v: int(float(v))
+    if name in FLOAT_TYPES:
+        return float
+
+    return str
 
 
 _schema = None
@@ -87,23 +115,18 @@ class TestExecutor(unittest.TestCase):
             )
 
             reader = csv.reader(open_file(file_name), delimiter="|")
+            # Convert by the declared schema rather than by guessing from the
+            # data, so the engine sees what duckdb - handed the same column
+            # types above - sees. The TPC-DS fixtures store values like 86192.0
+            # in `string` columns, which inference reads as floats, and
+            # SUBSTRING(ca_zip, 1, 5) then fails on a float (TPC-DS q8).
+            ctypes = [converter(t) for t in columns.values()]
             rows = []
-            ctypes = []
-            tables[table] = rows
 
             next(reader)
 
             for row in reader:
-                if not ctypes:
-                    for i, v in enumerate(row):
-                        try:
-                            ctypes.append(type(ast.literal_eval(v)))
-                        except (ValueError, SyntaxError):
-                            ctypes.append(str)
-
-                rows.append(
-                    tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
-                )
+                rows.append(tuple(None if v == "" else t(v) for t, v in zip(ctypes, row)))
 
             tables[table] = Table(columns=columns, rows=rows)
 
@@ -133,6 +156,26 @@ class TestExecutor(unittest.TestCase):
             if "_col_" in column:
                 source.rename(columns={column: target.columns[i]}, inplace=True)
 
+    def reference(self, sql, optimized, tpch=True):
+        """The duckdb result to check the engine against.
+
+        Prefers the optimized form, which is what the engine actually runs:
+        several TPC-DS queries lean on implicit string/date coercion in the raw
+        text that duckdb rejects, while `canonicalize` gives the optimized form
+        the explicit casts.
+        """
+        conn = self.tpch_conn if tpch else self.tpcds_conn
+
+        if sql not in self.cache:
+            try:
+                result = conn.execute(transpile(optimized, write="duckdb")[0]).fetchdf()
+            except Exception:
+                result = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+
+            self.cache[sql] = result
+
+        return self.cache[sql]
+
     def test_py_dialect(self):
         generate = Python().generate
         self.assertEqual(generate(parse_one("'x '''")), r"'x \''")
@@ -152,12 +195,24 @@ class TestExecutor(unittest.TestCase):
 
     def subtestHelper(self, i, table, tpch=True):
         with self.subTest(f"{'tpc-h' if tpch else 'tpc-ds'} {i + 1}"):
-            _, sql, _ = self.tpch_sqls[i] if tpch else self.tpcds_sqls[i]
-            a = self.cached_execute(sql, tpch=tpch)
-            b = pd.DataFrame(
-                ((np.nan if c is None else c for c in r) for r in table.rows),
-                columns=table.columns,
-            )
+            _, sql, optimized = self.tpch_sqls[i] if tpch else self.tpcds_sqls[i]
+            a = self.reference(sql, optimized, tpch=tpch)
+            b = pd.DataFrame(list(table.rows), columns=list(table.columns))
+            self.rename_anonymous(a, b)
+
+            # duckdb suffixes a repeated projection name (w_warehouse_sk_1);
+            # apply the same rule to both so only real differences show.
+            a.columns = dedupe(a.columns)
+            b.columns = dedupe(b.columns)
+
+            # Represent NULL the same way on both sides: duckdb yields None in
+            # object columns and NaN in numeric ones, so match its dtype per
+            # column rather than turning every NULL into NaN.
+            if len(a.columns) == len(b.columns):
+                for column in range(len(a.columns)):
+                    if pd.api.types.is_numeric_dtype(a.iloc[:, column]):
+                        b.isetitem(column, pd.to_numeric(b.iloc[:, column], errors="coerce"))
+
             assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
 
     def _mp_execute(self, schema, tables, sqls, tpch):

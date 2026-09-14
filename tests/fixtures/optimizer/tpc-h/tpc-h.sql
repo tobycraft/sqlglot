@@ -1,6 +1,7 @@
 --------------------------------------
 -- TPC-H 1
 --------------------------------------
+# execute: true
 select
         l_returnflag,
         l_linestatus,
@@ -54,6 +55,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 2
 --------------------------------------
+# execute: true
 select
    s_acctbal,
    s_name,
@@ -160,6 +162,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-H 3
 --------------------------------------
+# execute: true
 select
         l_orderkey,
         sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -212,6 +215,7 @@ LIMIT 10;
 --------------------------------------
 -- TPC-H 4
 --------------------------------------
+# execute: true
 select
         o_orderpriority,
         count(*) as order_count
@@ -260,6 +264,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 5
 --------------------------------------
+# execute: true
 select
         n_name,
         sum(l_extendedprice * (1 - l_discount)) as revenue
@@ -311,6 +316,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 6
 --------------------------------------
+# execute: true
 select
         sum(l_extendedprice * l_discount) as revenue
 from
@@ -333,6 +339,7 @@ WHERE
 --------------------------------------
 -- TPC-H 7
 --------------------------------------
+# execute: true
 select
         supp_nation,
         cust_nation,
@@ -416,6 +423,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 8
 --------------------------------------
+# execute: true
 select
         o_year,
         sum(case
@@ -493,6 +501,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 9
 --------------------------------------
+# execute: true
 select
         nation,
         o_year,
@@ -557,6 +566,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 10
 --------------------------------------
+# execute: true
 select
         c_custkey,
         c_name,
@@ -626,6 +636,7 @@ LIMIT 20;
 --------------------------------------
 -- TPC-H 11
 --------------------------------------
+# execute: true
 select
         ps_partkey,
         sum(ps_supplycost * ps_availqty) as value
@@ -693,6 +704,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 12
 --------------------------------------
+# execute: true
 select
         l_shipmode,
         sum(case
@@ -754,6 +766,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 13
 --------------------------------------
+# execute: true
 select
         c_count,
         count(*) as custdist
@@ -804,6 +817,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 14
 --------------------------------------
+# execute: true
 select
         100.00 * sum(case
                 when p_type like 'PROMO%'
@@ -839,6 +853,7 @@ WHERE
 --------------------------------------
 -- TPC-H 15
 --------------------------------------
+# execute: true
 with revenue (supplier_no, total_revenue) as (
         select
                 l_suppkey,
@@ -903,6 +918,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 16
 --------------------------------------
+# execute: true
 select
         p_brand,
         p_type,
@@ -965,6 +981,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 17
 --------------------------------------
+# execute: true
 select
         sum(l_extendedprice) / 7.0 as avg_yearly
 from
@@ -1005,6 +1022,7 @@ WHERE
 --------------------------------------
 -- TPC-H 18
 --------------------------------------
+# execute: true
 select
         c_name,
         c_custkey,
@@ -1078,6 +1096,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-H 19
 --------------------------------------
+# execute: true
 select
         sum(l_extendedprice* (1 - l_discount)) as revenue
 from
@@ -1190,6 +1209,7 @@ WHERE
 --------------------------------------
 -- TPC-H 20
 --------------------------------------
+# execute: true
 select
         s_name,
         s_address
@@ -1278,6 +1298,7 @@ ORDER BY
 --------------------------------------
 -- TPC-H 21
 --------------------------------------
+# execute: true
 select
         s_name,
         count(*) as numwait
@@ -1369,6 +1390,7 @@ LIMIT 100;
 --------------------------------------
 -- TPC-H 22
 --------------------------------------
+# execute: true
 select
         cntrycode,
         count(*) as numcust,
