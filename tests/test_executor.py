@@ -57,6 +57,8 @@ def dedupe(columns):
 
 INT_TYPES = {"int", "integer", "bigint", "smallint", "tinyint"}
 FLOAT_TYPES = {"double", "float", "real", "decimal"}
+DATE_TYPES = {"date"}
+DATETIME_TYPES = {"datetime", "timestamp"}
 
 
 def converter(type_):
@@ -68,6 +70,10 @@ def converter(type_):
         return lambda v: int(float(v))
     if name in FLOAT_TYPES:
         return float
+    if name in DATE_TYPES:
+        return datetime.date.fromisoformat
+    if name in DATETIME_TYPES:
+        return datetime.datetime.fromisoformat
 
     return str
 

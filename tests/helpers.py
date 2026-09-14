@@ -410,7 +410,7 @@ TPCDS_SCHEMA = {
     "date_dim": {
         "d_date_sk": "bigint",
         "d_date_id": "string",
-        "d_date": "string",
+        "d_date": "date",
         "d_month_seq": "bigint",
         "d_week_seq": "bigint",
         "d_quarter_seq": "bigint",
