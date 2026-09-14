@@ -180,6 +180,9 @@ class Step:
         operands: dict[exp.Expr, str] = {}
         aggregations: dict[exp.Expr, None] = {}
         next_operand_name = name_sequence("_a_")
+        next_hoisted_name = name_sequence("_hw_")
+        windows: dict[str, exp.Window] = {}
+        next_window_name = name_sequence("_w_")
 
         def extract_agg_operands(expression: exp.Expr) -> bool:
             agg_funcs = tuple(find_all_in_scope(expression, exp.AggFunc))
@@ -209,7 +212,27 @@ class Step:
             step.aggregations = list(aggregations)
 
         for e in expression.expressions:
-            if find_in_scope(e, exp.AggFunc):
+            windows_in_e = list(find_all_in_scope(e, exp.Window))
+            if windows_in_e:
+                bare = e.this if isinstance(e, exp.Alias) else e
+                if bare in windows_in_e:
+                    # the projection is a (possibly aliased) window with nothing
+                    # else wrapping it, e.g. `SUM(b) OVER (...) AS s`
+                    name = e.alias_or_name or next_window_name()
+                    windows[name] = bare
+                    projections.append(exp.column(name, step.name, quoted=True))
+                else:
+                    # the window's result is consumed by an enclosing expression
+                    # in the same select, e.g. `SUM(b) OVER (...) + 1` or a CASE
+                    # guarding on it; compute the window(s) as usual but keep the
+                    # wrapping expression, rewriting each window reference into a
+                    # column pointing at its value
+                    for window in windows_in_e:
+                        name = next_window_name()
+                        windows[name] = window
+                        window.replace(exp.column(name, step.name, quoted=True))
+                    projections.append(e)
+            elif find_in_scope(e, exp.AggFunc):
                 projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
                 extract_agg_operands(e)
             else:
@@ -221,6 +244,23 @@ class Step:
             step.condition = where.this
 
         group: exp.Group | None = expression.args.get("group")
+
+        # A window function alongside a GROUP BY operates on the query's
+        # *grouped* result set, per standard SQL - never on pre-aggregation rows
+        # - so Aggregate must run before Window here, the reverse of the
+        # windows-but-no-GROUP-BY case below. `intermediate`'s rewrite of a GROUP
+        # BY key reference into its aggregate-group alias is applied to each
+        # window body too, so e.g. `ROW_NUMBER() OVER (ORDER BY <group-by key>)`
+        # resolves against the aggregated output rather than the raw rows.
+        defer_windows = bool(windows) and (group is not None or aggregations)
+
+        if windows and not defer_windows:
+            window_step = Window()
+            window_step.source = step.name
+            window_step.name = step.name
+            window_step.windows = windows
+            window_step.add_dependency(step)
+            step = window_step
 
         if group is not None or aggregations:
             aggregate = Aggregate()
@@ -234,6 +274,35 @@ class Step:
                     aggregate.condition = exp.column("_h", step.name, quoted=True)
                 else:
                     aggregate.condition = having.this
+
+            if defer_windows:
+                # A deferred window runs on the *aggregated* rows, so an
+                # aggregate inside its frame has to be computed as one of this
+                # step's aggregations and read back as a column. GROUPING()
+                # included: it varies per row, each row coming from one grouping
+                # set, so it can't be folded in the window itself. `window.this`
+                # is excluded - that's the window function, which is computed
+                # over these rows rather than alongside them.
+                hoisted: dict[str, str] = {}
+
+                for window in windows.values():
+                    frame = list(window.args.get("partition_by") or [])
+                    window_order = window.args.get("order")
+
+                    if window_order:
+                        frame.append(window_order)
+
+                    for part in frame:
+                        for node in list(part.find_all(exp.AggFunc)):
+                            key = node.sql()
+                            name = hoisted.get(key)
+
+                            if name is None:
+                                name = next_hoisted_name()
+                                hoisted[key] = name
+                                extract_agg_operands(exp.alias_(node.copy(), name, quoted=True))
+
+                            node.replace(exp.column(name, step.name, quoted=True))
 
             set_ops_and_aggs(aggregate)
 
@@ -271,6 +340,13 @@ class Step:
                     if name:
                         node.replace(exp.column(name, step.name))
 
+            if defer_windows:
+                for window in windows.values():
+                    for node in window.walk():
+                        name = intermediate.get(node) or intermediate.get(node.name)
+                        if name:
+                            node.replace(exp.column(name, step.name))
+
             if aggregate.condition:
                 for node in aggregate.condition.walk():
                     name = intermediate.get(node) or intermediate.get(node.name)
@@ -279,6 +355,14 @@ class Step:
 
             aggregate.add_dependency(step)
             step = aggregate
+
+            if defer_windows:
+                window_step = Window()
+                window_step.source = step.name
+                window_step.name = step.name
+                window_step.windows = windows
+                window_step.add_dependency(step)
+                step = window_step
         else:
             aggregate = None
 
@@ -447,6 +531,21 @@ class Join(Step):
                 lines.append(f"{indent}Key: {join_key}")
             if join.get("condition"):
                 lines.append(f"{indent}On: {join['condition'].sql()}")  # type: ignore
+        return lines
+
+
+class Window(Step):
+    def __init__(self) -> None:
+        super().__init__()
+        self.windows: dict[str, exp.Window] = {}
+        self.source: str | None = None
+
+    def _to_s(self, indent: str) -> list[str]:
+        lines = [f"{indent}Windows:"]
+
+        for name, window in self.windows.items():
+            lines.append(f"{indent}  - {name}: {window.sql()}")
+
         return lines
 
 

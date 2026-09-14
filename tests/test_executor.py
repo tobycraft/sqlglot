@@ -1756,3 +1756,47 @@ class TestExecutor(unittest.TestCase):
                     sorted(result.rows, key=lambda r: tuple("" if v is None else str(v) for v in r)),
                     sorted(expected, key=lambda r: tuple("" if v is None else str(v) for v in r)),
                 )
+
+    def test_window_functions(self):
+        rows = [
+            {"a": 1, "b": 6},
+            {"a": 1, "b": 9},
+            {"a": 2, "b": 3},
+            {"a": 2, "b": 2},
+        ]
+        schema = {"t": {"a": "INT", "b": "INT"}}
+
+        for sql, expected in (
+            (
+                "SELECT a, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) AS r FROM t",
+                [(1, 1), (1, 2), (2, 1), (2, 2)],
+            ),
+            ("SELECT RANK() OVER (ORDER BY a) AS r FROM t", [(1,), (1,), (3,), (3,)]),
+            ("SELECT DENSE_RANK() OVER (ORDER BY a) AS r FROM t", [(1,), (1,), (2,), (2,)]),
+            (
+                "SELECT a, SUM(b) OVER (PARTITION BY a) AS s FROM t",
+                [(1, 15), (1, 15), (2, 5), (2, 5)],
+            ),
+            (
+                "SELECT a, LAG(b) OVER (PARTITION BY a ORDER BY b) AS l FROM t",
+                [(1, None), (1, 6), (2, None), (2, 2)],
+            ),
+            (
+                "SELECT a, LEAD(b) OVER (PARTITION BY a ORDER BY b) AS l FROM t",
+                [(1, 9), (1, None), (2, 3), (2, None)],
+            ),
+            # a window result consumed by an enclosing expression in the same select
+            (
+                "SELECT a, SUM(b) OVER (PARTITION BY a) + 1 AS s FROM t",
+                [(1, 16), (1, 16), (2, 6), (2, 6)],
+            ),
+            # a window alongside GROUP BY runs on the aggregated rows, so the
+            # aggregate in its frame has to be computed before it
+            (
+                "SELECT a, SUM(b) AS sb, RANK() OVER (ORDER BY SUM(b)) AS r FROM t GROUP BY a",
+                [(1, 15, 2), (2, 5, 1)],
+            ),
+        ):
+            with self.subTest(sql):
+                result = execute(sql, schema=schema, tables={"t": rows})
+                self.assertEqual(sorted(result.rows, key=str), sorted(expected, key=str))
