@@ -1907,3 +1907,22 @@ class TestExecutor(unittest.TestCase):
         for sql in ("SELECT a / z AS x FROM t", "SELECT a % z AS x FROM t"):
             with self.subTest(f"null: {sql}"):
                 self.assertIsNone(execute(sql, schema=schema, tables=nulls).rows[0][0])
+
+    def test_unpadded_date_literals(self):
+        # SQL engines accept an unpadded month or day, which date.fromisoformat
+        # rejects; TPC-DS writes several of its date bounds that way.
+        for sql, expected in (
+            ("SELECT CAST('2002-3-01' AS DATE) AS x", datetime.date(2002, 3, 1)),
+            ("SELECT CAST('2002-03-01' AS DATE) AS x", datetime.date(2002, 3, 1)),
+            ("SELECT CAST('1999-2-2' AS DATE) AS x", datetime.date(1999, 2, 2)),
+            (
+                "SELECT CAST('2002-3-1 05:06:07' AS TIMESTAMP) AS x",
+                datetime.datetime(2002, 3, 1, 5, 6, 7),
+            ),
+            (
+                "SELECT CAST('2002-3-1' AS TIMESTAMP) AS x",
+                datetime.datetime(2002, 3, 1),
+            ),
+        ):
+            with self.subTest(sql):
+                self.assertEqual(execute(sql).rows, [(expected,)])

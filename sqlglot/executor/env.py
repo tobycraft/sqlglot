@@ -146,6 +146,30 @@ def substring(this, start=None, length=None):
     return this[start:end]
 
 
+def parse_date(value):
+    """Parses a date literal, tolerating an unpadded month or day.
+
+    SQL engines accept `2002-3-01`, which `date.fromisoformat` rejects; TPC-DS
+    writes several of its date bounds that way.
+    """
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def parse_datetime(value):
+    """As `parse_date`, for a timestamp whose date part may be unpadded."""
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        date, _, time = value.partition(" ")
+        parsed = parse_date(date)
+        if not time:
+            return datetime.datetime(parsed.year, parsed.month, parsed.day)
+        return datetime.datetime.combine(parsed, datetime.time.fromisoformat(time))
+
+
 DECIMAL_TYPES = {
     exp.DType.DECIMAL,
     exp.DType.DECIMAL32,
@@ -168,7 +192,7 @@ def cast(this, to, *params):
         if isinstance(this, datetime.date):
             return this
         if isinstance(this, str):
-            return datetime.date.fromisoformat(this)
+            return parse_date(this)
     if to == exp.DType.TIME:
         if isinstance(this, datetime.datetime):
             return this.time()
@@ -182,7 +206,7 @@ def cast(this, to, *params):
         if isinstance(this, datetime.date):
             return datetime.datetime(this.year, this.month, this.day)
         if isinstance(this, str):
-            return datetime.datetime.fromisoformat(this)
+            return parse_datetime(this)
     if to == exp.DType.BOOLEAN:
         return bool(this)
     if to in exp.DataType.TEXT_TYPES:
@@ -322,7 +346,7 @@ ENV = {
     "SAFECONCAT": null_if_any(lambda *args: "".join(str(arg) for arg in args)),
     "CONCATWS": null_if_any(lambda this, *args: this.join(args)),
     "DATEDIFF": null_if_any(lambda this, expression, *_: (this - expression).days),
-    "DATESTRTODATE": null_if_any(lambda arg: datetime.date.fromisoformat(arg)),
+    "DATESTRTODATE": null_if_any(parse_date),
     "DIV": div,
     "DOT": null_if_any(lambda e, this: e[this]),
     "EQ": null_if_any(lambda this, e: this == e),
@@ -357,7 +381,7 @@ ENV = {
     "STRPOSITION": str_position,
     "SUB": null_if_any(lambda e, this: e - this),
     "SUBSTRING": substring,
-    "TIMESTRTOTIME": null_if_any(lambda arg: datetime.datetime.fromisoformat(arg)),
+    "TIMESTRTOTIME": null_if_any(parse_datetime),
     "UPPER": null_if_any(lambda arg: arg.upper()),
     "YEAR": null_if_any(lambda arg: arg.year),
     "MONTH": null_if_any(lambda arg: arg.month),
